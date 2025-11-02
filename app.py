@@ -73,6 +73,11 @@ def ocr_endpoint():
         # Devolver JSON con piezas
         return jsonify({"piezas": piezas, "lang": lang})
 
+@app.get("/")
+def home():
+    return "✅ Carpinter-IA API funcionando. Usa /health o POST /ocr"
+
+
 if __name__ == "__main__":
     # Render asigna el puerto en la env var PORT
     port = int(os.environ.get("PORT", 5000))
