@@ -1,20 +1,24 @@
+# Imagen base con Python y Tesseract
 FROM python:3.12-slim
 
-# Instalar dependencias del sistema + Tesseract (con idioma español)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Instalar dependencias de Tesseract y utilidades
+RUN apt-get update && apt-get install -y \
     tesseract-ocr \
-    tesseract-ocr-spa \
-    libglib2.0-0 libsm6 libxrender1 libxext6 \
-    && rm -rf /var/lib/apt/lists/*
+    libtesseract-dev \
+    libleptonica-dev \
+    && apt-get clean
 
-# Copiar el código al contenedor
+# Crear y usar directorio de trabajo
 WORKDIR /app
-COPY requirements.txt /app/
+
+# Copiar todos los archivos al contenedor
+COPY . .
+
+# Instalar dependencias de Python
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . /app
 
-# Render usa PORT, Flask debe escuchar en 0.0.0.0:$PORT
-ENV PORT=8000
-EXPOSE 8000
+# Exponer el puerto
+EXPOSE 5000
 
+# Comando para iniciar el servidor Flask (app.py)
 CMD ["python", "app.py"]
