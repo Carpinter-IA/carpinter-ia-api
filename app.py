@@ -1,14 +1,25 @@
 from flask import Flask, request, jsonify, send_file
-import os, tempfile, uuid, traceback, shutil, subprocess
-import werkzeug
+import os, tempfile, uuid, traceback, shutil, subprocess, werkzeug
 
+# Importar OCR
 from ocr_rayas_tesseract import analyze_image, exportar_pdf_maestro
 
 app = Flask(__name__)
 
-# En Linux (Render)
+# ======== CONFIGURACIÓN TESSSERACT ===========
+# En Render (Linux)
 os.environ.setdefault("TESSDATA_PREFIX", "/usr/share/tesseract-ocr/5/tessdata")
+
+# Fuerza el binario correcto para pytesseract
+try:
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+except Exception as e:
+    print("⚠️ No se pudo inicializar pytesseract:", e)
+
 PDF_MAESTRO_PATH = os.environ.get("PDF_MAESTRO_PATH", "Carpinter-IA_Despiece.pdf")
+
+# ============================================
 
 @app.get("/")
 def root():
@@ -20,7 +31,7 @@ def health():
 
 @app.get("/diag")
 def diag():
-    # Comprobaciones básicas para Tesseract y OpenCV
+    # Comprobaciones básicas
     try:
         import pytesseract, cv2
         t_path = shutil.which("tesseract")
@@ -66,11 +77,11 @@ def ocr_endpoint():
             return jsonify({"piezas": piezas, "lang": lang})
 
     except Exception as e:
-        # Devuelve el error como JSON y además saldrá en logs de Render
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
 
