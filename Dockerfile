@@ -1,27 +1,38 @@
-# Imagen base
+# Imagen base mínima
 FROM python:3.12-slim
 
-# Tesseract + idiomas + dependencias de OpenCV
-RUN apt-get update && apt-get install -y \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Paquetes necesarios en runtime:
+# - Tesseract + idiomas ENG/SPA
+# - Libs que necesita OpenCV (ruedas precompiladas)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-spa \
-    libtesseract-dev \
-    libleptonica-dev \
     libglib2.0-0 \
-    libgl1 \
-    libjpeg62-turbo \
+    libgomp1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
  && rm -rf /var/lib/apt/lists/*
 
-# App
+# Directorio de trabajo
 WORKDIR /app
-COPY . .
+
+# Instala deps de Python primero (cachea mejor)
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Entorno
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
-ENV PYTHONUNBUFFERED=1
+# Copia el resto del proyecto
+COPY . .
 
-# Gunicorn en Render
+# Tesseract data path en Debian/Ubuntu
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+ENV PORT=5000
+
 EXPOSE 5000
-CMD ["gunicorn","-w","2","-b","0.0.0.0:5000","app:app"]
+
+# Gunicorn en producción; 1 worker gthread para plan gratuito
+CMD ["gunicorn", "-w", "1", "-k", "gthread", "-t", "120", "-b", "0.0.0.0:5000", "app:app"]
