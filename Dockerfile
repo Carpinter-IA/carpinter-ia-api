@@ -20,5 +20,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Exponer el puerto
 EXPOSE 5000
 
-# Comando para iniciar el servidor Flask (app.py)
-CMD ["python", "app.py"]
+# Comando para iniciar el servidor Flask (usando gunicorn, recomendado por Render)
+CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
+
