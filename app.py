@@ -1,87 +1,128 @@
-from flask import Flask, request, jsonify, send_file
-import os, tempfile, uuid, traceback, shutil, subprocess, werkzeug
-
-# Importar OCR
-from ocr_rayas_tesseract import analyze_image, exportar_pdf_maestro
+import base64
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ======== CONFIGURACIÓN TESSSERACT ===========
-# En Render (Linux)
-os.environ.setdefault("TESSDATA_PREFIX", "/usr/share/tesseract-ocr/5/tessdata")
-
-# Fuerza el binario correcto para pytesseract
-try:
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-except Exception as e:
-    print("⚠️ No se pudo inicializar pytesseract:", e)
-
-PDF_MAESTRO_PATH = os.environ.get("PDF_MAESTRO_PATH", "Carpinter-IA_Despiece.pdf")
-
-# ============================================
-
-@app.get("/")
-def root():
-    return "✅ Carpinter-IA API online. Prueba /health, /diag o POST /ocr"
-
-@app.get("/health")
+# =========================
+#  ENDPOINT /health
+# =========================
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok"}), 200
 
-@app.get("/diag")
-def diag():
-    # Comprobaciones básicas
+
+# =========================
+#  FUNCIÓN DE OCR (A RELLENAR CON TU LÓGICA REAL)
+# =========================
+def procesar_imagen_ocr(image_bytes, diseno=None, material=None, espesor=None):
+    """
+    Aquí engancharás tu script real de OCR (ocr_rayas_tesseract.py).
+    De momento devolvemos datos de prueba para asegurarnos de que todo el flujo funciona.
+    """
+
+    piezas = [
+        {
+            "id": 1,
+            "descripcion": "Lateral",
+            "largo": 700,
+            "ancho": 330,
+            "espesor": espesor,
+            "material": material,
+            "diseno": diseno,
+        },
+        {
+            "id": 2,
+            "descripcion": "Tapa",
+            "largo": 800,
+            "ancho": 580,
+            "espesor": espesor,
+            "material": material,
+            "diseno": diseno,
+        },
+    ]
+
+    # De momento sin PDF/Excel reales (solo para probar que llega la imagen)
+    pdf_base64 = ""
+    xlsx_base64 = ""
+
+    return piezas, pdf_base64, xlsx_base64
+
+
+# =========================
+#  ENDPOINT /ocr_json (EL QUE USA ChatGPT)
+# =========================
+@app.route("/ocr_json", methods=["POST"])
+def ocr_json():
+    """
+    Recibe:
+      - image_url: URL pública de la imagen que ChatGPT ha subido
+      - diseno, material, espesor: textos opcionales
+
+    ChatGPT manda un JSON con esos campos.
+    """
+
+    data = request.get_json(silent=True) or {}
+
+    image_url = data.get("image_url")
+    if not image_url:
+        return jsonify({"error": "Falta 'image_url' en el cuerpo JSON"}), 400
+
     try:
-        import pytesseract, cv2
-        t_path = shutil.which("tesseract")
-        t_ver = str(pytesseract.get_tesseract_version())
-        langs = subprocess.check_output(
-            ["tesseract", "--list-langs"], stderr=subprocess.STDOUT, text=True
-        )
-        return jsonify({
-            "tesseract_path": t_path,
-            "tesseract_version": t_ver,
-            "tessdata_prefix": os.environ.get("TESSDATA_PREFIX"),
-            "tesseract_langs": langs.splitlines(),
-            "opencv_version": cv2.__version__,
-        })
+        # Descargar la imagen desde la URL
+        resp = requests.get(image_url)
+        resp.raise_for_status()
     except Exception as e:
-        return jsonify({"diag_error": str(e), "trace": traceback.format_exc()}), 500
+        return jsonify({"error": f"No se pudo descargar la imagen desde image_url: {e}"}), 400
 
-@app.post("/ocr")
+    image_bytes = resp.content
+
+    diseno = data.get("diseno")
+    material = data.get("material")
+    espesor = data.get("espesor")
+
+    piezas, pdf_base64, xlsx_base64 = procesar_imagen_ocr(
+        image_bytes=image_bytes,
+        diseno=diseno,
+        material=material,
+        espesor=espesor,
+    )
+
+    return jsonify({
+        "piezas": piezas,
+        "pdf_base64": pdf_base64,
+        "xlsx_base64": xlsx_base64,
+    }), 200
+
+
+# =========================
+#  ENDPOINT /ocr (lo dejamos por compatibilidad, pero el GPT YA NO lo usa)
+# =========================
+@app.route("/ocr", methods=["POST"])
 def ocr_endpoint():
-    try:
-        if "file" not in request.files:
-            return jsonify({"error": "Sube un archivo en el campo 'file'"}), 400
+    file = request.files.get("file")
+    if file is None:
+        return jsonify({"error": "Sube un archivo en el campo 'file'"}), 400
 
-        f: werkzeug.datastructures.FileStorage = request.files["file"]
-        lang = request.form.get("lang", "eng+spa")
-        return_pdf = request.form.get("return_pdf", "false").lower() == "true"
+    image_bytes = file.read()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fname = str(uuid.uuid4()) + "_" + werkzeug.utils.secure_filename(f.filename)
-            img_path = os.path.join(tmpdir, fname)
-            f.save(img_path)
+    diseno = request.form.get("diseno")
+    material = request.form.get("material")
+    espesor = request.form.get("espesor")
 
-            piezas = analyze_image(img_path, lang=lang)
+    piezas, pdf_base64, xlsx_base64 = procesar_imagen_ocr(
+        image_bytes=image_bytes,
+        diseno=diseno,
+        material=material,
+        espesor=espesor,
+    )
 
-            if not piezas:
-                return jsonify({"piezas": [], "message": "No se detectaron piezas"}), 200
+    return jsonify({
+        "piezas": piezas,
+        "pdf_base64": pdf_base64,
+        "xlsx_base64": xlsx_base64,
+    }), 200
 
-            if return_pdf:
-                out_pdf = os.path.join(tmpdir, "resultado_despiece.pdf")
-                exportar_pdf_maestro(piezas, maestro_path=PDF_MAESTRO_PATH, salida_path=out_pdf)
-                return send_file(out_pdf, as_attachment=True, download_name="resultado_despiece.pdf")
-
-            return jsonify({"piezas": piezas, "lang": lang})
-
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
+    app.run(host="0.0.0.0", port=5000, debug=True)
