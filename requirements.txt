@@ -1,9 +1,23 @@
+# ==== CORE ====
 Flask==3.0.3
 gunicorn==21.2.0
-opencv-python-headless==4.12.0.88
-pillow==10.4.0
-pytesseract==0.3.13
-pypdf==6.1.3
-imutils==0.5.4
-numpy==2.2.6
+Werkzeug==3.0.3
+requests==2.32.3
+packaging==24.0
+
+# ==== IMÁGENES ====
+Pillow==10.4.0
+
+# ==== PDF ====
+pypdf==4.3.1
 reportlab==4.2.5
+
+# ==== OCR / VISIÓN ====
+pytesseract==0.3.13
+opencv-python-headless==4.10.0.84
+
+# Numpy compatible con OpenCV y Tesseract
+numpy==1.26.4
+
+# ==== EXCEL ====
+openpyxl==3.1.2
