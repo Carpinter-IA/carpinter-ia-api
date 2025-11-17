@@ -1,30 +1,10 @@
+import io
+import base64
 import requests
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # ⬅️ para permitir CORS
-
-# =========================
-#  PDF DEMO EN BASE64
-#  (así siempre devolvemos un PDF válido mientras montamos el OCR real)
-# =========================
-DEMO_PDF_BASE64 = (
-    "JVBERi0xLjMKJZOMi54gUmVwb3J0TGFiIEdlbmVyYXRlZCBQREYgZG9jdW1lbnQgaHR0cDovL3d3dy5y"
-    "ZXBvcnRsYWIuY29tCjEgMCBvYmoKPDwKL0YxIDIgMCBSCi9GMiAzIDAgUgo+PgplbmRvYmoKMiAwIG9i"
-    "ago8PAovVHlwZSAvRm9udAovU3VidHlwZSAvVHlwZTEKL05hbWUgL0YxCi9CYXNlRm9udCAvSGVsdmV0"
-    "aWNhCi9FbmNvZGluZyAvV2luQW5zaUVuY29kaW5nCj4+CmVuZG9iagozIDAgb2JqCjw8Ci9UeXBlIC9G"
-    "b250Ci9TdWJ0eXBlIC9UeXBlMQovTmFtZSAvRjIKL0Jhc2VGb250IC9IZWx2ZXRpY2EtQm9sZAovRW5j"
-    "b2RpbmcgL1dpbkFuc2lFbmNvZGluZwo+PgplbmRvYmoKNCAwIG9iago8PAovVHlwZSAvUGFnZXMKL0tp"
-    "ZHMgWzUgMCBSXQovQ291bnQgMQovTWVkaWFCb3ggWzAgMCA1OTUuMjc2IDg0MS44ODldCj4+CmVuZG9i"
-    "ago1IDAgb2JqCjw8Ci9UeXBlIC9QYWdlCi9QYXJlbnQgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8"
-    "PAovRjEgMiAwIFIKL0YyIDMgMCBSCj4+PgovUHJvY1NldCAvUERGCj4+Ci9NZWRpYUJveCBbMCAwIDU5"
-    "NS4yNzYgODQxLjg4OV0KL0NvbnRlbnRzIDYgMCBSCj4+CmVuZG9iago2IDAgb2JqCjw8Ci9MZW5ndGgg"
-    "MTk5Cj4+CnN0cmVhbQpCBiAwIDAgMCAwIDAKVGQKQkcgL0YxIDE0IFRmCjcyIDgwMiBUZChDYXJwaW50"
-    "ZXItSUEgLSBQREYgZGVtbykgVGoKQlIKQkcgL0YyIDEyIFRmCjcyIDc4MiBUZChFc3RlIGVzIHVuIFBE"
-    "RiBkZSBwcnVlYmEgZ2VuZXJhZG8gcG9yIENhcnBpbnRlci1JQS4pIFRqCkJSClQKQlIKZW5kc3RyZWFt"
-    "CmVuZG9iagcKeHJlZgowIDcKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDE3IDAwMDAwIG4gCjAw"
-    "MDAwMDAxMDkgMDAwMDAgbiAKMDAwMDAwMDE5NCAwMDAwMCBuIAowMDAwMDAwMzE1IDAwMDAwIG4gCjAw"
-    "MDAwMDA0NDggMDAwMDAgbiAKMDAwMDAwMDYyMyAwMDAwMCBuIAp0cmFpbGVyCjw8Ci9TaXplIDcKL1Jv"
-    "b3QgMSAwIFIKL0luZm8gNyAwIFIKPj4Kc3RhcnR4cmVmCjcxOQolJUVPRgo="
-)
+from flask_cors import CORS  # para permitir CORS
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 
 app = Flask(__name__)
 
@@ -38,6 +18,54 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
+
+# =========================
+#  Función auxiliar: generar un PDF DEMO
+# =========================
+def generar_pdf_demo(diseno=None, material=None, espesor=None, cliente=None):
+    """
+    Genera un PDF muy sencillo con la info básica y lo devuelve en base64 (str).
+    """
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    titulo = "Carpinter-IA - PDF demo"
+    subtitulo = "Versión de prueba WebApp (sin OCR real todavía)"
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(72, height - 72, titulo)
+
+    c.setFont("Helvetica", 12)
+    c.drawString(72, height - 96, subtitulo)
+
+    y = height - 140
+    c.setFont("Helvetica", 11)
+
+    if cliente:
+        c.drawString(72, y, f"Cliente / proyecto: {cliente}")
+        y -= 18
+    if diseno:
+        c.drawString(72, y, f"Diseño: {diseno}")
+        y -= 18
+    if material:
+        c.drawString(72, y, f"Material: {material}")
+        y -= 18
+    if espesor:
+        c.drawString(72, y, f"Espesor: {espesor}")
+        y -= 18
+
+    c.drawString(72, y - 10, "Este PDF es solo de prueba para validar el flujo WebApp → API → PDF.")
+    c.drawString(72, y - 28, "Más adelante aquí irá el despiece real generado por Carpinter-IA.")
+
+    c.showPage()
+    c.save()
+
+    buffer.seek(0)
+    pdf_bytes = buffer.read()
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    return pdf_b64
 
 
 # =========================
@@ -72,8 +100,8 @@ def procesar_imagen_ocr_desde_url(image_url, diseno=None, material=None, espesor
         },
     ]
 
-    # Por ahora devolvemos el PDF DEMO
-    pdf_base64 = DEMO_PDF_BASE64
+    # PDF DEMO
+    pdf_base64 = generar_pdf_demo(diseno=diseno, material=material, espesor=espesor)
     xlsx_base64 = ""  # de momento vacío
 
     return piezas, pdf_base64, xlsx_base64
@@ -113,9 +141,13 @@ def procesar_imagen_ocr_desde_file(file_storage, diseno=None, material=None, esp
         },
     ]
 
-    # Aquí iría la generación real del PDF y Excel.
-    # De momento devolvemos SIEMPRE el PDF DEMO.
-    pdf_base64 = DEMO_PDF_BASE64
+    # PDF DEMO con datos del formulario
+    pdf_base64 = generar_pdf_demo(
+        diseno=diseno,
+        material=material,
+        espesor=espesor,
+        cliente=cliente,
+    )
     xlsx_base64 = ""
 
     return piezas, pdf_base64, xlsx_base64
