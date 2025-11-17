@@ -12,12 +12,14 @@ Pillow==10.4.0
 pypdf==4.3.1
 reportlab==4.2.5
 
-# ==== OCR / VISIÓN ====
+# ==== OCR / VISIÓN (opcionales) ====
 pytesseract==0.3.13
 opencv-python-headless==4.10.0.84
 
-# Numpy compatible con OpenCV y Tesseract
+# NUMPY (versión compatible)
 numpy==1.26.4
 
 # ==== EXCEL ====
 openpyxl==3.1.2
+
+flask-cors
