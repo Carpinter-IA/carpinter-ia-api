@@ -21,11 +21,12 @@ def health():
 
 
 # =========================
-#  Función auxiliar: generar un PDF DEMO
+#  PDF DEMO (por si hace falta de respaldo)
 # =========================
 def generar_pdf_demo(diseno=None, material=None, espesor=None, cliente=None):
     """
     Genera un PDF muy sencillo con la info básica y lo devuelve en base64 (str).
+    (Lo dejamos como respaldo por si el maestro no se encuentra).
     """
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -69,6 +70,25 @@ def generar_pdf_demo(diseno=None, material=None, espesor=None, cliente=None):
 
 
 # =========================
+#  PDF MAESTRO (plantilla Carpinter-IA_Despiece.pdf)
+# =========================
+def generar_pdf_maestro():
+    """
+    Carga el PDF maestro Carpinter-IA_Despiece.pdf y lo devuelve en base64.
+    De momento lo mandamos tal cual (en blanco).
+    Más adelante podemos rellenarlo con datos.
+    """
+    try:
+        with open("Carpinter-IA_Despiece.pdf", "rb") as f:
+            pdf_bytes = f.read()
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        return pdf_b64
+    except FileNotFoundError:
+        # Si no encuentra el maestro, usamos el PDF demo para no romper nada.
+        return generar_pdf_demo()
+
+
+# =========================
 #  Función de “OCR” de prueba con URL
 #  (la usaremos desde /ocr_json)
 # =========================
@@ -100,8 +120,8 @@ def procesar_imagen_ocr_desde_url(image_url, diseno=None, material=None, espesor
         },
     ]
 
-    # PDF DEMO
-    pdf_base64 = generar_pdf_demo(diseno=diseno, material=material, espesor=espesor)
+    # Aquí, en vez de demo, devolvemos el PDF maestro
+    pdf_base64 = generar_pdf_maestro()
     xlsx_base64 = ""  # de momento vacío
 
     return piezas, pdf_base64, xlsx_base64
@@ -141,13 +161,8 @@ def procesar_imagen_ocr_desde_file(file_storage, diseno=None, material=None, esp
         },
     ]
 
-    # PDF DEMO con datos del formulario
-    pdf_base64 = generar_pdf_demo(
-        diseno=diseno,
-        material=material,
-        espesor=espesor,
-        cliente=cliente,
-    )
+    # Devolvemos el PDF maestro
+    pdf_base64 = generar_pdf_maestro()
     xlsx_base64 = ""
 
     return piezas, pdf_base64, xlsx_base64
