@@ -4,11 +4,15 @@ from typing import List, Dict
 
 import requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 
 app = Flask(__name__)
+# Habilitamos CORS para TODAS las rutas y orígenes
+CORS(app, resources={r"/*": {"origins": "*"}})
+
 
 # =====================================================
 #  1) ENDPOINT /health
@@ -20,7 +24,6 @@ def health():
 
 # =====================================================
 #  2) FUNCIÓN OCR "DE PRUEBA"
-#     (Luego aquí enchufaremos tu ocr_rayas_tesseract.py)
 # =====================================================
 def ocr_mock_desde_imagen_bytes(
     image_bytes: bytes,
@@ -30,8 +33,7 @@ def ocr_mock_desde_imagen_bytes(
 ) -> List[Dict]:
     """
     Esta función simula el resultado del OCR.
-    Devuelve una lista de piezas con medidas.
-    Más adelante la sustituiremos por tu OCR real.
+    Más adelante la sustituiremos por tu ocr_rayas_tesseract.py.
     """
 
     piezas = [
@@ -74,8 +76,6 @@ def generar_pdf_maestro(
 ) -> bytes:
     """
     Genera un PDF sencillo con cabecera + lista de piezas.
-    De momento no usa una plantilla gráfica, pero ya es
-    el PDF “maestro” con medidas.
     """
 
     buffer = io.BytesIO()
@@ -97,7 +97,6 @@ def generar_pdf_maestro(
     c.drawString(40, y, f"Espesor: {espesor or '-'}")
     y -= 22
 
-    # Línea separadora
     c.line(40, y, width - 40, y)
     y -= 18
 
@@ -115,7 +114,6 @@ def generar_pdf_maestro(
 
     for pieza in piezas:
         if y < 60:
-            # Nueva página si no cabe
             c.showPage()
             y = height - 40
             c.setFont("Helvetica-Bold", 10)
@@ -149,21 +147,6 @@ def generar_pdf_maestro(
 # =====================================================
 @app.route("/ocr", methods=["POST"])
 def ocr():
-    """
-    Recibe:
-      - file (imagen)
-      - material (opcional)
-      - espesor  (opcional)
-      - cliente  (opcional)
-
-    Devuelve JSON:
-      {
-        "piezas": [...],
-        "pdf_base64": "...",
-        "xlsx_base64": ""
-      }
-    """
-
     if "file" not in request.files:
         return jsonify({"error": "Falta el archivo 'file' en multipart/form-data"}), 400
 
@@ -175,7 +158,6 @@ def ocr():
     image_bytes = file.read()
 
     try:
-        # 1) OCR (de momento mock)
         piezas = ocr_mock_desde_imagen_bytes(
             image_bytes=image_bytes,
             material=material,
@@ -183,7 +165,6 @@ def ocr():
             cliente=cliente,
         )
 
-        # 2) Generar PDF maestro con esas piezas
         pdf_bytes = generar_pdf_maestro(
             cliente=cliente or "",
             material=material or "",
@@ -197,7 +178,7 @@ def ocr():
             {
                 "piezas": piezas,
                 "pdf_base64": pdf_b64,
-                "xlsx_base64": "",  # más adelante generaremos también el Excel
+                "xlsx_base64": "",
             }
         ), 200
 
@@ -210,16 +191,6 @@ def ocr():
 # =====================================================
 @app.route("/ocr_json", methods=["POST"])
 def ocr_json():
-    """
-    Espera un JSON:
-    {
-      "image_url": "https://....",
-      "material": "Roble Aurora",
-      "espesor": "16 mm",
-      "cliente": "Carpintería X - Proyecto Y"
-    }
-    """
-
     data = request.get_json(silent=True) or {}
     image_url = data.get("image_url")
 
@@ -231,14 +202,12 @@ def ocr_json():
     cliente = data.get("cliente")
 
     try:
-        # Descargar imagen
         resp = requests.get(image_url)
         if resp.status_code >= 400:
             raise ValueError(f"No se pudo descargar la imagen (status {resp.status_code})")
 
         image_bytes = resp.content
 
-        # OCR mock
         piezas = ocr_mock_desde_imagen_bytes(
             image_bytes=image_bytes,
             material=material,
@@ -246,7 +215,6 @@ def ocr_json():
             cliente=cliente,
         )
 
-        # Generar PDF maestro
         pdf_bytes = generar_pdf_maestro(
             cliente=cliente or "",
             material=material or "",
@@ -258,8 +226,8 @@ def ocr_json():
         return jsonify(
             {
                 "piezas": piezas,
-                "pdf_base64": pdf_b64,
-                "xlsx_base64": "",
+            "pdf_base64": pdf_b64,
+            "xlsx_base64": "",
             }
         ), 200
 
