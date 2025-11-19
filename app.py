@@ -1,239 +1,123 @@
-import io
+import os
 import base64
-from typing import List, Dict
-
-import requests
+import tempfile
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
+from PIL import Image
+from pypdf import PdfReader, PdfWriter
+from openpyxl import Workbook
+from io import BytesIO
 
 app = Flask(__name__)
-# Habilitamos CORS para TODAS las rutas y orígenes
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
+
+# ============================
+#   RUTA DEL PDF MAESTRO
+# ============================
+PDF_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(__file__), 
+    "Carpinter-IA_Despiece.pdf"
+)
 
 
-# =====================================================
-#  1) ENDPOINT /health
-# =====================================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok"})
 
 
-# =====================================================
-#  2) FUNCIÓN OCR "DE PRUEBA"
-# =====================================================
-def ocr_mock_desde_imagen_bytes(
-    image_bytes: bytes,
-    material: str = None,
-    espesor: str = None,
-    cliente: str = None,
-) -> List[Dict]:
-    """
-    Esta función simula el resultado del OCR.
-    Más adelante la sustituiremos por tu ocr_rayas_tesseract.py.
-    """
-
-    piezas = [
-        {
-            "id": 1,
-            "descripcion": "Lateral",
-            "largo": 700,
-            "ancho": 330,
-            "espesor": espesor or "16 mm",
-            "material": material or "Roble demo",
-        },
-        {
-            "id": 2,
-            "descripcion": "Tapa",
-            "largo": 800,
-            "ancho": 580,
-            "espesor": espesor or "16 mm",
-            "material": material or "Roble demo",
-        },
-        {
-            "id": 3,
-            "descripcion": "Base",
-            "largo": 800,
-            "ancho": 330,
-            "espesor": espesor or "16 mm",
-            "material": material or "Roble demo",
-        },
-    ]
-    return piezas
-
-
-# =====================================================
-#  3) FUNCIÓN PARA GENERAR PDF MAESTRO
-# =====================================================
-def generar_pdf_maestro(
-    cliente: str,
-    material: str,
-    espesor: str,
-    piezas: List[Dict],
-) -> bytes:
-    """
-    Genera un PDF sencillo con cabecera + lista de piezas.
-    """
-
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    y = height - 40
-
-    # Cabecera
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, y, "Carpinter-IA - Despiece")
-    y -= 25
-
-    c.setFont("Helvetica", 10)
-    c.drawString(40, y, f"Cliente / proyecto: {cliente or '-'}")
-    y -= 14
-    c.drawString(40, y, f"Material: {material or '-'}")
-    y -= 14
-    c.drawString(40, y, f"Espesor: {espesor or '-'}")
-    y -= 22
-
-    c.line(40, y, width - 40, y)
-    y -= 18
-
-    # Cabecera tabla
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(40, y, "ID")
-    c.drawString(70, y, "Descripción")
-    c.drawString(220, y, "Largo (mm)")
-    c.drawString(300, y, "Ancho (mm)")
-    c.drawString(390, y, "Espesor")
-    c.drawString(460, y, "Material")
-    y -= 14
-
-    c.setFont("Helvetica", 10)
-
-    for pieza in piezas:
-        if y < 60:
-            c.showPage()
-            y = height - 40
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(40, y, "ID")
-            c.drawString(70, y, "Descripción")
-            c.drawString(220, y, "Largo (mm)")
-            c.drawString(300, y, "Ancho (mm)")
-            c.drawString(390, y, "Espesor")
-            c.drawString(460, y, "Material")
-            y -= 14
-            c.setFont("Helvetica", 10)
-
-        c.drawString(40, y, str(pieza.get("id", "")))
-        c.drawString(70, y, str(pieza.get("descripcion", "")))
-        c.drawString(220, y, str(pieza.get("largo", "")))
-        c.drawString(300, y, str(pieza.get("ancho", "")))
-        c.drawString(390, y, str(pieza.get("espesor", "")))
-        c.drawString(460, y, str(pieza.get("material", "")))
-        y -= 14
-
-    c.showPage()
-    c.save()
-
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    return pdf_bytes
-
-
-# =====================================================
-#  4) ENDPOINT /ocr  (usa la WebApp)
-# =====================================================
 @app.route("/ocr", methods=["POST"])
-def ocr():
-    if "file" not in request.files:
-        return jsonify({"error": "Falta el archivo 'file' en multipart/form-data"}), 400
-
-    file = request.files["file"]
-    material = request.form.get("material")
-    espesor = request.form.get("espesor")
-    cliente = request.form.get("cliente")
-
-    image_bytes = file.read()
-
+def ocr_process():
     try:
-        piezas = ocr_mock_desde_imagen_bytes(
-            image_bytes=image_bytes,
-            material=material,
-            espesor=espesor,
-            cliente=cliente,
-        )
+        # ---------------------------
+        # 1. Validar archivo enviado
+        # ---------------------------
+        if "file" not in request.files:
+            return jsonify({"error": "No se envió archivo 'file'"}), 400
 
-        pdf_bytes = generar_pdf_maestro(
-            cliente=cliente or "",
-            material=material or "",
-            espesor=espesor or "",
-            piezas=piezas,
-        )
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "Archivo vacío"}), 400
 
-        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        image = Image.open(file.stream)
 
-        return jsonify(
-            {
-                "piezas": piezas,
-                "pdf_base64": pdf_b64,
-                "xlsx_base64": "",
-            }
-        ), 200
+        # ---------------------------------------------
+        #   Simulamos OCR (hasta que lo activemos real)
+        # ---------------------------------------------
+        piezas = [
+            {"nombre": "Lateral Izquierdo", "medidas": "800 x 400", "cantidad": 1},
+            {"nombre": "Lateral Derecho", "medidas": "800 x 400", "cantidad": 1},
+            {"nombre": "Base", "medidas": "700 x 400", "cantidad": 1},
+        ]
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # ============================
+        #   GENERAR EXCEL DESPIECE
+        # ============================
+        excel_output = BytesIO()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Despiece"
 
+        ws.append(["Pieza", "Medidas", "Cantidad"])
+        for p in piezas:
+            ws.append([p["nombre"], p["medidas"], p["cantidad"]])
 
-# =====================================================
-#  5) ENDPOINT /ocr_json (para GPT, usa image_url)
-# =====================================================
-@app.route("/ocr_json", methods=["POST"])
-def ocr_json():
-    data = request.get_json(silent=True) or {}
-    image_url = data.get("image_url")
+        wb.save(excel_output)
+        excel_output.seek(0)
 
-    if not image_url:
-        return jsonify({"error": "Falta 'image_url' en el cuerpo JSON"}), 400
+        # ============================
+        #   GENERAR PDF DESDE PLANTILLA
+        # ============================
+        if not os.path.exists(PDF_TEMPLATE_PATH):
+            return jsonify({"error": f"NO se encontró la plantilla: {PDF_TEMPLATE_PATH}"}), 500
 
-    material = data.get("material")
-    espesor = data.get("espesor")
-    cliente = data.get("cliente")
+        print("📄 Usando plantilla PDF:", PDF_TEMPLATE_PATH)
 
-    try:
-        resp = requests.get(image_url)
-        if resp.status_code >= 400:
-            raise ValueError(f"No se pudo descargar la imagen (status {resp.status_code})")
+        reader = PdfReader(PDF_TEMPLATE_PATH)
+        writer = PdfWriter()
 
-        image_bytes = resp.content
+        page = reader.pages[0]
 
-        piezas = ocr_mock_desde_imagen_bytes(
-            image_bytes=image_bytes,
-            material=material,
-            espesor=espesor,
-            cliente=cliente,
-        )
+        # Texto superpuesto
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
 
-        pdf_bytes = generar_pdf_maestro(
-            cliente=cliente or "",
-            material=material or "",
-            espesor=espesor or "",
-            piezas=piezas,
-        )
-        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        packet = BytesIO()
+        can = canvas.Canvas(packet, pagesize=A4)
+        can.setFont("Helvetica", 10)
 
-        return jsonify(
-            {
-                "piezas": piezas,
-            "pdf_base64": pdf_b64,
-            "xlsx_base64": "",
-            }
-        ), 200
+        y = 730
+        for p in piezas:
+            can.drawString(50, y, f"{p['nombre']} — {p['medidas']} — Cant: {p['cantidad']}")
+            y -= 15
+
+        can.save()
+        packet.seek(0)
+
+        # Fusionar
+        overlay = PdfReader(packet)
+        page.merge_page(overlay.pages[0])
+        writer.add_page(page)
+
+        final_pdf = BytesIO()
+        writer.write(final_pdf)
+        final_pdf.seek(0)
+
+        # ============================
+        # RESPUESTA EN BASE64
+        # ============================
+        pdf_b64 = base64.b64encode(final_pdf.read()).decode("utf-8")
+        excel_b64 = base64.b64encode(excel_output.read()).decode("utf-8")
+
+        return jsonify({
+            "status": "ok",
+            "pdf": pdf_b64,
+            "excel": excel_b64,
+            "piezas": piezas
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
