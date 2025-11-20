@@ -18,7 +18,6 @@ CORS(app)
 # ============================
 #   RUTA DEL PDF MAESTRO
 # ============================
-# OJO: el nombre debe coincidir EXACTAMENTE con el archivo que tienes en GitHub.
 PDF_TEMPLATE_PATH = os.path.join(
     os.path.dirname(__file__),
     "Carpinter-IA_Despiece.pdf"
@@ -35,11 +34,6 @@ def health():
 
 # ============================
 #   ENDPOINT PRINCIPAL /ocr
-#   - Recibe: multipart/form-data
-#     * file  -> imagen del despiece
-#     * material (opcional)
-#     * espesor (opcional)
-#     * cliente (opcional)
 # ============================
 @app.route("/ocr", methods=["POST"])
 def ocr():
@@ -54,23 +48,22 @@ def ocr():
         if file.filename == "":
             return jsonify({"error": "El archivo está vacío"}), 400
 
-        # Solo validamos que la imagen se pueda abrir (no la usamos aún para OCR real)
+        # Validar que es imagen
         try:
             image = Image.open(file.stream)
-            image.verify()  # comprueba que es una imagen válida
+            image.verify()
         except Exception:
             return jsonify({"error": "El archivo enviado no es una imagen válida"}), 400
 
         # --------------------------------
-        # 2. Campos adicionales del formulario
+        # 2. Campos adicionales
         # --------------------------------
         material = request.form.get("material", "").strip()
         espesor = request.form.get("espesor", "").strip()
         cliente = request.form.get("cliente", "").strip()
 
         # --------------------------------
-        # 3. Piezas de ejemplo (hasta conectar OCR real)
-        #    Aquí luego engancharemos ocr_rayas_tesseract.py
+        # 3. Piezas DEMO (luego irá el OCR real)
         # --------------------------------
         piezas = [
             {"nombre": "Lateral izquierdo", "medidas": "800 x 400", "cantidad": 1},
@@ -79,16 +72,14 @@ def ocr():
         ]
 
         # ============================
-        #   GENERAR EXCEL (DESPIECE)
+        #   EXCEL DE DESPIECE
         # ============================
         excel_buffer = BytesIO()
         wb = Workbook()
         ws = wb.active
         ws.title = "Despiece"
 
-        # Cabeceras
         ws.append(["Pieza", "Medidas", "Cantidad"])
-        # Datos
         for p in piezas:
             ws.append([p["nombre"], p["medidas"], p["cantidad"]])
 
@@ -96,50 +87,51 @@ def ocr():
         excel_buffer.seek(0)
 
         # ============================
-        #   GENERAR PDF DESDE PLANTILLA
+        #   PDF DESDE PLANTILLA
         # ============================
         if not os.path.exists(PDF_TEMPLATE_PATH):
             return jsonify({
                 "error": f"No se ha encontrado la plantilla PDF en {PDF_TEMPLATE_PATH}"
             }), 500
 
-        # Cargamos la plantilla
         template_reader = PdfReader(PDF_TEMPLATE_PATH)
         writer = PdfWriter()
         base_page = template_reader.pages[0]
 
-        # Creamos una capa con ReportLab
+        # Capa nueva con ReportLab
         packet = BytesIO()
         can = canvas.Canvas(packet, pagesize=A4)
         can.setFont("Helvetica", 10)
 
-        # Coordenadas base (puedes ajustarlas más adelante)
-        x_text = 50
-        y_text = 760
+        # ---- CABECERA (debajo del logo, encima de “Datos del cliente”) ----
+        header_x = 50
+        header_y = 780
 
-        # Encabezado con datos del proyecto
+        y = header_y
         if cliente:
-            can.drawString(x_text, y_text, f"Cliente / proyecto: {cliente}")
-            y_text -= 15
+            can.drawString(header_x, y, f"Cliente / proyecto: {cliente}")
+            y -= 15
         if material:
-            can.drawString(x_text, y_text, f"Material: {material}")
-            y_text -= 15
+            can.drawString(header_x, y, f"Material: {material}")
+            y -= 15
         if espesor:
-            can.drawString(x_text, y_text, f"Espesor: {espesor}")
-            y_text -= 25
-        else:
-            y_text -= 10
+            can.drawString(header_x, y, f"Espesor: {espesor}")
+            y -= 15
 
-        # Título de la tabla
+        # ---- TEXTO DE DESPIECE (lo bajamos, para que no tape “Datos del cliente”) ----
+        x_text = 50
+        # Esta altura la hemos elegido para que quede entre “Datos del cliente”
+        # y “Piezas solicitadas”. Si se solapa un poco, luego ajustamos unos puntos.
+        y_text = 560
+
         can.drawString(x_text, y_text, "Despiece generado (versión demo sin OCR real):")
         y_text -= 20
 
-        # Dibujar cada pieza
         for p in piezas:
             linea = f"- {p['nombre']} | {p['medidas']} | Cant: {p['cantidad']}"
             can.drawString(x_text, y_text, linea)
             y_text -= 15
-            if y_text < 80:  # por si se llena la página
+            if y_text < 80:  # por si se llena demasiado
                 break
 
         can.save()
@@ -148,7 +140,6 @@ def ocr():
         overlay_reader = PdfReader(packet)
         overlay_page = overlay_reader.pages[0]
 
-        # Fusionamos la capa de texto con la plantilla
         base_page.merge_page(overlay_page)
         writer.add_page(base_page)
 
@@ -157,12 +148,11 @@ def ocr():
         pdf_buffer.seek(0)
 
         # ============================
-        #   CODIFICAR EN BASE64
+        #   BASE64
         # ============================
         pdf_base64 = base64.b64encode(pdf_buffer.read()).decode("utf-8")
         excel_base64 = base64.b64encode(excel_buffer.read()).decode("utf-8")
 
-        # Respuesta final
         return jsonify({
             "status": "ok",
             "mensaje": "Despiece generado correctamente (modo demo).",
@@ -172,11 +162,9 @@ def ocr():
         }), 200
 
     except Exception as e:
-        # Para depurar mejor si algo falla
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # Solo para pruebas locales, en Render se usa gunicorn con el PORT que ellos ponen
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=True)
