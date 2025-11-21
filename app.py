@@ -1,128 +1,168 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-from pypdf import PdfReader, PdfWriter
-from openpyxl import Workbook
-from io import BytesIO
 import os
-import base64
-from PIL import Image
+from io import BytesIO
+
+from flask import Flask, request, send_file, jsonify
+from flask_cors import CORS
+
+# Usamos la librería que tienes en requirements.txt
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+
+# -------------------------------------------------------------------
+# CONFIGURACIÓN BÁSICA
+# -------------------------------------------------------------------
 
 app = Flask(__name__)
 CORS(app)
 
-# ===============================
-# RUTA DEL PDF MAESTRO (FINAL)
-# ===============================
-PDF_TEMPLATE_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "Carpinter-IA_Despiece.pdf"  # <<--- ESTE ES EL PDF QUE ESTAMOS USANDO
-)
+# Ruta del PDF maestro (debe llamarse así en el servidor)
+PDF_TEMPLATE_NAME = "Carpinter-IA_Despiece.pdf"
+PDF_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), PDF_TEMPLATE_NAME)
 
-# ===============================
-# HEALTH CHECK
-# ===============================
+
+# -------------------------------------------------------------------
+# ENDPOINT DE SALUD
+# -------------------------------------------------------------------
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
-# ===============================
+
+# -------------------------------------------------------------------
+# FUNCIÓN PARA GENERAR EL PDF DE DESPIECE
+# -------------------------------------------------------------------
+
+def generar_pdf_despiece(material: str, espesor: str, cliente: str) -> bytes:
+    """
+    Genera un PDF a partir del PDF maestro, escribiendo encima
+    un despiece DEMO sin usar campos de formulario (sin AcroForm).
+    Devuelve los bytes del PDF final.
+    """
+
+    if not os.path.exists(PDF_TEMPLATE_PATH):
+        raise FileNotFoundError(f"No se encuentra la plantilla: {PDF_TEMPLATE_PATH}")
+
+    # 1) Leemos la plantilla
+    reader = PdfReader(PDF_TEMPLATE_PATH)
+    base_page = reader.pages[0]
+
+    # Dimensiones de la página para colocar el texto
+    width = float(base_page.mediabox.width)
+    height = float(base_page.mediabox.height)
+
+    # 2) Creamos un PDF "overlay" con reportlab donde escribimos el texto
+    packet = BytesIO()
+    can = canvas.Canvas(packet, pagesize=(width, height))
+
+    # Fuente pequeña para que quepa bien
+    can.setFont("Helvetica", 8)
+
+    # ----------------------------------------------------------------
+    # CABECERA DE TEXTO DEL DESPIECE (debajo de “Piezas solicitadas”)
+    # ----------------------------------------------------------------
+    # Coordenadas aproximadas (puedes afinar si quieres)
+    # (0,0) está abajo a la izquierda.
+    y_inicio = height - 300  # más o menos donde empieza la tabla
+    x_texto = 60
+
+    linea_intro = "Despiece generado (versión demo sin OCR real):"
+    can.drawString(x_texto, y_inicio, linea_intro)
+
+    y = y_inicio - 12
+
+    # DEMO de piezas (puedes cambiar los textos cuando quieras)
+    piezas_demo = [
+        {"nombre": "Lateral izquierdo", "largo": 800, "ancho": 400, "cant": 1},
+        {"nombre": "Lateral derecho", "largo": 800, "ancho": 400, "cant": 1},
+        {"nombre": "Base", "largo": 700, "ancho": 400, "cant": 1},
+    ]
+
+    for pieza in piezas_demo:
+        linea = (
+            f"- {pieza['nombre']} | "
+            f"{pieza['largo']} x {pieza['ancho']} | "
+            f"{espesor} | Cant: {pieza['cant']}"
+        )
+        can.drawString(x_texto + 10, y, linea)
+        y -= 12
+
+    # Si quieres también podemos escribir el material, espesor y cliente
+    # en algún punto de la hoja (de momento lo dejamos solo en la intro).
+    # Ejemplo (descomenta si lo quieres):
+    #
+    # can.setFont("Helvetica-Bold", 9)
+    # can.drawString(60, height - 260, f"Cliente / proyecto: {cliente}")
+    # can.drawString(60, height - 272, f"Material: {material}")
+    # can.drawString(60, height - 284, f"Espesor: {espesor}")
+
+    can.save()
+    packet.seek(0)
+
+    overlay_reader = PdfReader(packet)
+
+    # 3) Fusionamos la plantilla con el overlay
+    writer = PdfWriter()
+    base_page.merge_page(overlay_reader.pages[0])
+    writer.add_page(base_page)
+
+    # 4) Guardamos en memoria
+    output_pdf = BytesIO()
+    writer.write(output_pdf)
+    output_pdf.seek(0)
+
+    return output_pdf.read()
+
+
+# -------------------------------------------------------------------
 # ENDPOINT PRINCIPAL /ocr
-# ===============================
+# -------------------------------------------------------------------
+
 @app.route("/ocr", methods=["POST"])
-def ocr_process():
+def ocr_endpoint():
+    """
+    Recibe:
+      - file: imagen del despiece (no la procesamos en esta DEMO)
+      - material: texto libre
+      - espesor: texto libre
+      - cliente: texto libre
+
+    Devuelve:
+      - Un PDF (application/pdf) generado a partir de la plantilla.
+    """
+
     try:
-        # ================
-        # 1. Recibir IMAGEN
-        # ================
-        if "file" not in request.files:
-            return jsonify({"error": "No se recibió ninguna imagen"}), 400
+        # Imagen (por ahora no usamos OCR en esta versión demo)
+        file = request.files.get("file")
+        if file is None:
+            return jsonify({"error": "Falta el archivo 'file' en el formulario"}), 400
 
-        file = request.files["file"]
-        img = Image.open(file.stream)
+        # Campos de texto del formulario
+        material = request.form.get("material", "").strip() or "Material sin especificar"
+        espesor = request.form.get("espesor", "").strip() or "Espesor sin especificar"
+        cliente = request.form.get("cliente", "").strip() or "Cliente sin especificar"
 
-        # ================
-        # 2. Recibir datos del formulario
-        # ================
-        material = request.form.get("material", "")
-        espesor = request.form.get("espesor", "")
-        cliente = request.form.get("cliente", "")
+        # Generamos el PDF
+        pdf_bytes = generar_pdf_despiece(material, espesor, cliente)
 
-        # ================
-        # 3. Datos de prueba (sin OCR real)
-        # ================
-        piezas = [
-            {"ref": "Lateral izquierdo", "largo": "800", "ancho": "400", "espesor": espesor, "cantidad": "1", "L1": "1", "L2": "0", "A1": "0", "A2": "0"},
-            {"ref": "Lateral derecho", "largo": "800", "ancho": "400", "espesor": espesor, "cantidad": "1", "L1": "1", "L2": "0", "A1": "0", "A2": "0"},
-            {"ref": "Base", "largo": "700", "ancho": "400", "espesor": espesor, "cantidad": "1", "L1": "0", "L2": "0", "A1": "0", "A2": "0"},
-        ]
-
-        # ================
-        # 4. Rellenar PDF MAESTRO
-        # ================
-        reader = PdfReader(PDF_TEMPLATE_PATH)
-        writer = PdfWriter()
-
-        page = reader.pages[0]
-
-        # FORM FIELDS (exactos del PDF maestro)
-        writer.add_page(page)
-        writer.update_page_form_field_values(writer.pages[0], {
-            "NOMBRE": cliente,
-            "MATERIAL": material,
-            "ESPESOR": espesor
-        })
-
-        # -------------------------
-        # Rellenar las piezas
-        # -------------------------
-        for i, p in enumerate(piezas):
-            idx = str(i + 1)
-            writer.update_page_form_field_values(writer.pages[0], {
-                f"ref_{idx}": p["ref"],
-                f"largo_{idx}": p["largo"],
-                f"ancho_{idx}": p["ancho"],
-                f"espesor_{idx}": p["espesor"],
-                f"cantidad_{idx}": p["cantidad"],
-                f"L1_{idx}": p["L1"],
-                f"L2_{idx}": p["L2"],
-                f"A1_{idx}": p["A1"],
-                f"A2_{idx}": p["A2"]
-            })
-
-        # Guardar PDF en memoria
-        pdf_output = BytesIO()
-        writer.write(pdf_output)
-        pdf_output.seek(0)
-
-        # ================
-        # 5. Exportar Excel
-        # ================
-        wb = Workbook()
-        ws = wb.active
-        ws.append(["REF", "LARGO", "ANCHO", "ESPESOR", "CANTIDAD", "L1", "L2", "A1", "A2"])
-        for p in piezas:
-            ws.append([p["ref"], p["largo"], p["ancho"], p["espesor"], p["cantidad"], p["L1"], p["L2"], p["A1"], p["A2"]])
-
-        excel_output = BytesIO()
-        wb.save(excel_output)
-        excel_output.seek(0)
-
-        # ================
-        # 6. Convertir PDF → base64
-        # ================
-        pdf_b64 = base64.b64encode(pdf_output.getvalue()).decode("utf-8")
-
-        return jsonify({
-            "status": "ok",
-            "pdf_base64": pdf_b64
-        })
+        # Devolvemos el PDF directamente
+        return send_file(
+            BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name="Carpinter-IA_Despiece.pdf",
+        )
 
     except Exception as e:
+        # Para ver el error en los logs de Render
+        print("Error en /ocr:", repr(e))
         return jsonify({"error": str(e)}), 500
 
 
-# ===============================
-# MAIN LOCAL
-# ===============================
+# -------------------------------------------------------------------
+# MAIN LOCAL (por si quieres probarlo en tu PC)
+# -------------------------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Solo para desarrollo local. En Render se lanza con Gunicorn.
+    app.run(host="0.0.0.0", port=5000, debug=True)
