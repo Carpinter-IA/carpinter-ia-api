@@ -2,20 +2,17 @@
 """
 ocr_rayas_tesseract.py
 OCR robusto para Carpinter-IA:
-- preprocesado (CLAHE, denoise, threshold)
+- preprocesado (CLAHE, denoise, adaptive threshold)
 - deskew (rotación automática)
-- detección de cajas de texto por contornos
-- OCR por caja con varios psm y combinación de resultados
-- extracción de parejas (cantidad, largo x ancho)
-
-Requisitos: opencv-python-headless, pytesseract, numpy, Pillow
+- detección de regiones de texto por morfología + contornos (versión permisiva)
+- OCR por caja con varios PSM y combinación de resultados
+- postprocesado regex para extraer (cantidad, largo x ancho)
+- devuelve piezas con coords x,y,w,h para que app.py pueda dibujar overlays / rellenar PDF
 """
 
 import os
 import re
 import sys
-import time
-import math
 import csv
 import platform
 import numpy as np
@@ -36,8 +33,10 @@ else:
         if os.path.exists(default_win):
             pytesseract.pytesseract.tesseract_cmd = default_win
         else:
+            # dejamos la ruta por defecto como hint en Windows (si no existe dará error al ejecutar)
             pytesseract.pytesseract.tesseract_cmd = default_win
     else:
+        # En contenedores Linux usualmente está en /usr/bin/tesseract
         pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 if TESSDATA_PREFIX_ENV:
@@ -48,31 +47,28 @@ else:
     else:
         TESSDATA_DIR = "/usr/share/tessdata"
 
+# Aseguramos que la variable de entorno esté puesta
 os.environ.pop("TESSDATA_PREFIX", None)
 os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
 # ============================================================================
+
 # Parámetros ajustables
 MAX_SIDE = 1600
 OCR_TIMEOUT_LINE = 10
 OCR_TIMEOUT_GLOBAL = 30
 OCR_DEBUG = bool(os.environ.get("OCR_DEBUG", "") == "1")
 
-# ==== Helpers / utilidades ====
 def _log(*args, **kwargs):
     if OCR_DEBUG:
         print("[OCR DEBUG]", *args, **kwargs)
 
-# regex mejorada para pares: acepta "3 = 400 x 500", "3: 400x500", "3 400x500" etc.
+# Regex robusta para extraer pares: acepta "3 = 400 x 500", "3: 400x500", "400x500", etc.
 _pair_pattern = re.compile(
-    r"(?:\b(\d{1,2})\b\s*[:=\-]?\s*)?"           # opcional cantidad (1-2 dígitos) + separador
-    r"(\d{2,4})\s*[x×X]\s*(\d{2,4})"             # largo x ancho
+    r"(?:\b(\d{1,2})\b\s*[:=\-]?\s*)?"  # cantidad opcional
+    r"(\d{2,4})\s*[x×X]\s*(\d{2,4})"    # largo x ancho
 )
 
 def _extract_pairs_from_text(texto):
-    """
-    Extrae tuplas (cantidad, largo, ancho) de un texto dado.
-    Filtra por límites razonables.
-    """
     texto = texto.replace("×", "x")
     texto = texto.replace(",", " ")
     out = []
@@ -81,14 +77,13 @@ def _extract_pairs_from_text(texto):
             cant = int(m.group(1)) if m.group(1) else 1
             largo = int(m.group(2))
             ancho = int(m.group(3))
-            # límites de plausibilidad (mm)
             if 30 <= largo <= 4000 and 30 <= ancho <= 4000 and 1 <= cant <= 99:
                 out.append((cant, largo, ancho))
         except Exception:
             continue
     return out
 
-# ==== Preprocesado ====
+# ==== Preprocesado y utilidades ====
 def _resize_keep_aspect(img, max_side=MAX_SIDE):
     h, w = img.shape[:2]
     if max(h, w) <= max_side:
@@ -100,7 +95,7 @@ def _resize_keep_aspect(img, max_side=MAX_SIDE):
     return resized, scale
 
 def _deskew_image(gray):
-    # calcula ángulo usando momentos de bordes o Hough
+    # intenta estimar la inclinación mediante minAreaRect de los pixeles oscuros
     coords = np.column_stack(np.where(gray < 128))
     if coords.shape[0] < 10:
         return gray, 0.0
@@ -108,7 +103,6 @@ def _deskew_image(gray):
     angle = rect[-1]
     if angle < -45:
         angle = 90 + angle
-    # rotación si la inclinación es significativa
     if abs(angle) < 1.0:
         return gray, 0.0
     (h, w) = gray.shape[:2]
@@ -118,57 +112,53 @@ def _deskew_image(gray):
     return rotated, angle
 
 def _preprocess(img_bgr):
-    # copia local y trabajable
     img = img_bgr.copy()
-    # convertir a gris
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # aplicar CLAHE para mejorar contraste local
+    # CLAHE
     try:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
         gray = clahe.apply(gray)
     except Exception:
         pass
 
-    # denoise ligero (bilateral preserva bordes)
+    # denoise ligero
     gray = cv2.bilateralFilter(gray, 7, 75, 75)
 
-    # intentar deskew en una copia
+    # deskew
     deskewed, angle = _deskew_image(gray)
     gray = deskewed
 
-    # umbral adaptativo (mejor para papel manuscrito)
+    # umbral adaptativo y máscara invertida
     th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 15, 8)
-    # invertimos (texto oscuro sobre fondo claro -> queremos texto en negro)
     inv = 255 - th
 
-    # morfología para unir trazos horizontales de una línea
+    # morfología para unir trazos (kernel rectangular horizontal)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15,3))
     morph = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # retorno: imagen en gris mejorada + la máscara morfologica para detectar regiones
     return gray, morph, angle
 
-# ==== Detección de cajas de texto mediante contornos ====
+# ==== Versión PERMISIVA de detección de cajas (reemplaza función antigua) ====
 def _find_text_boxes(morph_mask):
     contours, _ = cv2.findContours(morph_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     for cnt in contours:
         x,y,w,h = cv2.boundingRect(cnt)
-        # filtrado por área y aspecto
-        area = w*h
-        if area < 2000:           # area mínima (ajustable)
+        area = w * h
+        # Filtrado más permisivo para manuscritos pequeños
+        if area < 500:
             continue
-        if w < 60 or h < 18:      # caja demasiado estrecha/pequeña
+        if w < 40 or h < 12:
             continue
-        # posible ratio muy alargado -> ignorar si es solo una línea decorativa
-        if w/h < 1.2 and h < 25:
+        # evitar cajas extremadamente estrechas y pequeñas
+        if w/h < 0.6 and h < 20:
             continue
         boxes.append((x,y,w,h,area))
-    # ordenar de arriba a abajo por y
+    # ordenar por y (de arriba a abajo)
     boxes = sorted(boxes, key=lambda b: b[1])
-    # fusionar cajas muy cercanas (misma línea)
+    # fusionar cajas cercanas (misma línea) — parámetros más permisivos
     merged = []
     for b in boxes:
         if not merged:
@@ -176,8 +166,8 @@ def _find_text_boxes(morph_mask):
         else:
             x,y,w,h,area = b
             px,py,pw,ph,parea = merged[-1]
-            # si verticalmente muy cerca y se solapan horizontalmente -> unir
-            if (y - (py+ph)) < 18 and (x < px+pw+20 and px < x+ w + 20):
+            # si verticalmente muy cerca o solapan horizontalmente, unir
+            if (y - (py+ph)) < 30 and (x < px+pw+40 and px < x+ w + 40):
                 nx = min(x,px)
                 ny = min(y,py)
                 nw = max(x+w, px+pw) - nx
@@ -187,7 +177,7 @@ def _find_text_boxes(morph_mask):
                 merged.append(b)
     return merged
 
-# ==== OCR por caja combinando varios psm y filtrando ====
+# ==== OCR por caja combinando configuraciones ====
 def _ocr_box_text(img_bgr, box, lang="eng+spa"):
     x,y,w,h,area = box
     pad = 6
@@ -197,14 +187,10 @@ def _ocr_box_text(img_bgr, box, lang="eng+spa"):
     roi = img_bgr[y0:y1, x0:x1]
     if roi.size == 0:
         return ""
-    # convertir a PIL para pytesseract si hace falta
     pil = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
 
-    # configuraciones: whitelist + numeric bias
     base_cfg = "-c tessedit_char_whitelist=0123456789xX:= -c classify_bln_numeric_mode=1 -c user_defined_dpi=200"
-
     results = []
-    # probar varios psm (7 = linea, 6 = bloque, 11 = sparse text)
     for psm in (7, 6, 11):
         cfg = f"{base_cfg} --psm {psm}"
         try:
@@ -215,7 +201,6 @@ def _ocr_box_text(img_bgr, box, lang="eng+spa"):
         txt = re.sub(r"\s+", " ", txt).strip()
         if txt:
             results.append((psm, txt))
-    # si no hay texto, tratar ROI con binarización extra
     if not results:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -229,11 +214,9 @@ def _ocr_box_text(img_bgr, box, lang="eng+spa"):
         except RuntimeError:
             pass
 
-    # seleccionar mejor resultado heurístico (más dígitos, formato válido)
     best = ""
     best_score = -1
     for psm, t in results:
-        # score = cantidad de dígitos encontrados + presencia de 'x'
         digits = len(re.findall(r"\d", t))
         has_x = 2 if re.search(r"[xX]", t) else 0
         score = digits + has_x
@@ -242,18 +225,12 @@ def _ocr_box_text(img_bgr, box, lang="eng+spa"):
             best_score = score
     return best
 
-# ==== Función principal: analyze_image ====
+# ==== Función principal ====
 def analyze_image(path, lang="eng+spa"):
     """
-    Entrada: path (imagen)
-    Salida: lista de piezas. Cada pieza = {
-        "cantidad": int,
-        "largo": int,
-        "ancho": int,
-        "cantos": {...},
-        "ocr_texto": str,
-        "x": int, "y": int, "w": int, "h": int
-    }
+    Entrada: path a imagen
+    Salida: lista de piezas con keys:
+      cantidad, largo, ancho, cantos, ocr_texto, x, y, w, h
     """
     _log("Analyze image:", path)
     if not os.path.exists(path):
@@ -265,7 +242,6 @@ def analyze_image(path, lang="eng+spa"):
         _log("cv2.imread devolvió None")
         return []
 
-    # redimensionar para velocidad y consistencia
     img, scale = _resize_keep_aspect(img, MAX_SIDE)
     ih, iw = img.shape[:2]
     _log("imagen resized:", iw, ih, "scale", scale)
@@ -274,23 +250,19 @@ def analyze_image(path, lang="eng+spa"):
     _log("deskew angle:", angle)
 
     boxes = _find_text_boxes(morph)
-    _log("boxes detectadas:", boxes)
+    _log("boxes detectadas (post merge):", boxes)
 
     piezas = []
-    seen_texts = set()
+    seen_keys = set()
     for b in boxes:
         txt = _ocr_box_text(img, b, lang=lang)
         _log("OCR caja:", b, "=>", txt)
         if not txt or len(re.sub(r"\D", "", txt)) < 2:
-            # texto demasiado corto -> ignorar
             continue
-        # extraer pares
         pares = _extract_pairs_from_text(txt)
         if not pares:
-            # intentar combinar con texto cercano (vecinos)
-            # mirar una franja vertical alrededor y concatenar OCR completo
+            # intentar lectura en una franja vertical ampliada alrededor de la caja
             x,y,w,h,area = b
-            # zona ampliada
             pad_h = int(h * 0.8)
             y0 = max(0, y - pad_h)
             y1 = min(ih, y + h + pad_h)
@@ -304,7 +276,6 @@ def analyze_image(path, lang="eng+spa"):
                 pares = _extract_pairs_from_text(txt_strip)
             except RuntimeError:
                 pares = []
-        # si encontramos pares, creamos piezas por cada par (multiplicar si cantidad>1)
         if pares:
             for (cant, largo, ancho) in pares:
                 piece = {
@@ -313,20 +284,18 @@ def analyze_image(path, lang="eng+spa"):
                     "ancho": ancho,
                     "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
                     "ocr_texto": txt,
-                    # ajustamos coordenadas a la escala original (app puede esperar px en imagen redimensionada)
                     "x": int(b[0] / scale),
                     "y": int(b[1] / scale),
                     "w": int(b[2] / scale),
                     "h": int(b[3] / scale),
                 }
-                # evitar duplicados por cajas solapadas
                 key = f"{cant}-{largo}-{ancho}-{piece['x']}-{piece['y']}"
-                if key in seen_texts:
+                if key in seen_keys:
                     continue
-                seen_texts.add(key)
+                seen_keys.add(key)
                 piezas.append(piece)
 
-    # fallback: si no hay piezas detectadas, intentar OCR global con regex
+    # fallback global si no hay nada
     if not piezas:
         _log("No se detectaron piezas por cajas; probando OCR global")
         try:
@@ -345,7 +314,7 @@ def analyze_image(path, lang="eng+spa"):
         except RuntimeError:
             pass
 
-    # opcional: escribir CSV de debug si se solicita por variable de entorno
+    # dump CSV si se activa por env var
     if os.environ.get("OCR_DUMP_CSV") == "1":
         try:
             with open("resultado_despiece.csv", "w", newline="", encoding="utf-8") as f:
@@ -353,13 +322,13 @@ def analyze_image(path, lang="eng+spa"):
                 wcsv.writerow(["cantidad", "largo", "ancho", "x", "y", "w", "h", "texto"])
                 for p in piezas:
                     wcsv.writerow([p["cantidad"], p["largo"], p["ancho"], p["x"], p["y"], p["w"], p["h"], p["ocr_texto"]])
-        except Exception:
-            pass
+        except Exception as e:
+            _log("Error al escribir CSV:", e)
 
     _log("Piezas finales:", piezas)
     return piezas
 
-# ========== Si se ejecuta como script para prueba local ==========
+# Si se ejecuta como script (pruebas locales)
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso: python ocr_rayas_tesseract.py imagen.jpg")
