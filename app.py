@@ -1,168 +1,78 @@
+# --- pega este bloque en tu backend Python (ej: app.py) ---
 import os
-from io import BytesIO
-
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
-
-# Usamos la librería que tienes en requirements.txt
-from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-
-# -------------------------------------------------------------------
-# CONFIGURACIÓN BÁSICA
-# -------------------------------------------------------------------
+import json
+from flask import Flask, request, send_file, jsonify, make_response
 
 app = Flask(__name__)
-CORS(app)
 
-# Ruta del PDF maestro (debe llamarse así en el servidor)
-PDF_TEMPLATE_NAME = "Carpinter-IA_Despiece.pdf"
-PDF_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), PDF_TEMPLATE_NAME)
+DEBUG_JSON_PATH = "/tmp/carpinteria_last_result.json"  # o usa una ruta en tu proyecto
 
-
-# -------------------------------------------------------------------
-# ENDPOINT DE SALUD
-# -------------------------------------------------------------------
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-
-# -------------------------------------------------------------------
-# FUNCIÓN PARA GENERAR EL PDF DE DESPIECE
-# -------------------------------------------------------------------
-
-def generar_pdf_despiece(material: str, espesor: str, cliente: str) -> bytes:
+def save_debug_json(piezas, image_width, image_height, meta=None):
     """
-    Genera un PDF a partir del PDF maestro, escribiendo encima
-    un despiece DEMO sin usar campos de formulario (sin AcroForm).
-    Devuelve los bytes del PDF final.
+    Guarda un JSON con la última detección para depuración.
+    'piezas' debe ser lista de objetos con keys: id, nombre, x, y, w, h, texto (px coords).
     """
+    payload = {
+        "piezas": piezas,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
+    if meta:
+        payload["meta"] = meta
+    with open(DEBUG_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    app.logger.info(f"Debug JSON saved to {DEBUG_JSON_PATH}")
 
-    if not os.path.exists(PDF_TEMPLATE_PATH):
-        raise FileNotFoundError(f"No se encuentra la plantilla: {PDF_TEMPLATE_PATH}")
+@app.route("/last_result.json", methods=["GET"])
+def last_result():
+    """Devuelve el JSON de debug si existe."""
+    if not os.path.exists(DEBUG_JSON_PATH):
+        return jsonify({"error": "no debug result saved yet"}), 404
+    with open(DEBUG_JSON_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return jsonify(data)
 
-    # 1) Leemos la plantilla
-    reader = PdfReader(PDF_TEMPLATE_PATH)
-    base_page = reader.pages[0]
-
-    # Dimensiones de la página para colocar el texto
-    width = float(base_page.mediabox.width)
-    height = float(base_page.mediabox.height)
-
-    # 2) Creamos un PDF "overlay" con reportlab donde escribimos el texto
-    packet = BytesIO()
-    can = canvas.Canvas(packet, pagesize=(width, height))
-
-    # Fuente pequeña para que quepa bien
-    can.setFont("Helvetica", 8)
-
-    # ----------------------------------------------------------------
-    # CABECERA DE TEXTO DEL DESPIECE (debajo de “Piezas solicitadas”)
-    # ----------------------------------------------------------------
-    # Coordenadas aproximadas (puedes afinar si quieres)
-    # (0,0) está abajo a la izquierda.
-    y_inicio = height - 300  # más o menos donde empieza la tabla
-    x_texto = 60
-
-    linea_intro = "Despiece generado (versión demo sin OCR real):"
-    can.drawString(x_texto, y_inicio, linea_intro)
-
-    y = y_inicio - 12
-
-    # DEMO de piezas (puedes cambiar los textos cuando quieras)
-    piezas_demo = [
-        {"nombre": "Lateral izquierdo", "largo": 800, "ancho": 400, "cant": 1},
-        {"nombre": "Lateral derecho", "largo": 800, "ancho": 400, "cant": 1},
-        {"nombre": "Base", "largo": 700, "ancho": 400, "cant": 1},
-    ]
-
-    for pieza in piezas_demo:
-        linea = (
-            f"- {pieza['nombre']} | "
-            f"{pieza['largo']} x {pieza['ancho']} | "
-            f"{espesor} | Cant: {pieza['cant']}"
-        )
-        can.drawString(x_texto + 10, y, linea)
-        y -= 12
-
-    # Si quieres también podemos escribir el material, espesor y cliente
-    # en algún punto de la hoja (de momento lo dejamos solo en la intro).
-    # Ejemplo (descomenta si lo quieres):
-    #
-    # can.setFont("Helvetica-Bold", 9)
-    # can.drawString(60, height - 260, f"Cliente / proyecto: {cliente}")
-    # can.drawString(60, height - 272, f"Material: {material}")
-    # can.drawString(60, height - 284, f"Espesor: {espesor}")
-
-    can.save()
-    packet.seek(0)
-
-    overlay_reader = PdfReader(packet)
-
-    # 3) Fusionamos la plantilla con el overlay
-    writer = PdfWriter()
-    base_page.merge_page(overlay_reader.pages[0])
-    writer.add_page(base_page)
-
-    # 4) Guardamos en memoria
-    output_pdf = BytesIO()
-    writer.write(output_pdf)
-    output_pdf.seek(0)
-
-    return output_pdf.read()
-
-
-# -------------------------------------------------------------------
-# ENDPOINT PRINCIPAL /ocr
-# -------------------------------------------------------------------
-
+# Ejemplo de integración en tu endpoint /ocr:
 @app.route("/ocr", methods=["POST"])
 def ocr_endpoint():
     """
-    Recibe:
-      - file: imagen del despiece (no la procesamos en esta DEMO)
-      - material: texto libre
-      - espesor: texto libre
-      - cliente: texto libre
-
-    Devuelve:
-      - Un PDF (application/pdf) generado a partir de la plantilla.
+    Ejemplo simplificado: conservar tu lógica actual.
+    Aquí llamamos a tu función de OCR que devuelve 'piezas' y dims,
+    luego generamos el PDF (o lo genera tu pipeline) y lo devolvemos como application/pdf.
     """
+    # 1) obtenemos la imagen y metadatos
+    file = request.files.get("file")
+    material = request.form.get("material")
+    espesor = request.form.get("espesor")
+    cliente = request.form.get("cliente")
 
-    try:
-        # Imagen (por ahora no usamos OCR en esta versión demo)
-        file = request.files.get("file")
-        if file is None:
-            return jsonify({"error": "Falta el archivo 'file' en el formulario"}), 400
+    if not file:
+        return jsonify({"error": "file missing"}), 400
 
-        # Campos de texto del formulario
-        material = request.form.get("material", "").strip() or "Material sin especificar"
-        espesor = request.form.get("espesor", "").strip() or "Espesor sin especificar"
-        cliente = request.form.get("cliente", "").strip() or "Cliente sin especificar"
+    # Guarda temporalmente la imagen (opcional)
+    tmp_img_path = "/tmp/last_uploaded.jpg"
+    file.save(tmp_img_path)
 
-        # Generamos el PDF
-        pdf_bytes = generar_pdf_despiece(material, espesor, cliente)
+    # 2) LLAMA AQUÍ A TU FUNCIÓN DE OCR existente
+    # Debe devolver lista 'piezas' y 'image_width','image_height' en px y texto por pieza.
+    # Por ejemplo:
+    # piezas = [
+    #   {"id":1,"nombre":"Lateral izquierdo","x":120,"y":200,"w":800,"h":400,"texto":"800 x 400 | 16mm | Cant:1"},
+    #   ...
+    # ]
+    # image_w, image_h = 3000, 2000
+    #
+    # --- >>> reemplaza la siguiente línea por tu llamada real al OCR <<< ---
+    piezas, image_w, image_h = run_your_ocr_and_get_pieces(tmp_img_path)  # implementa esta función
+    # ---------------------------------------------------------------------
 
-        # Devolvemos el PDF directamente
-        return send_file(
-            BytesIO(pdf_bytes),
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name="Carpinter-IA_Despiece.pdf",
-        )
+    # 3) guarda JSON de debug (para que lo puedas recuperar con /last_result.json)
+    save_debug_json(piezas, image_w, image_h, meta={"material": material, "espesor": espesor, "cliente": cliente})
 
-    except Exception as e:
-        # Para ver el error en los logs de Render
-        print("Error en /ocr:", repr(e))
-        return jsonify({"error": str(e)}), 500
-
-
-# -------------------------------------------------------------------
-# MAIN LOCAL (por si quieres probarlo en tu PC)
-# -------------------------------------------------------------------
-
-if __name__ == "__main__":
-    # Solo para desarrollo local. En Render se lanza con Gunicorn.
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # 4) genera el PDF (o usa tu lógica actual) y envíalo como response
+    # Supongamos que tu pipeline genera '/tmp/output.pdf'
+    output_pdf = "/tmp/output.pdf"
+    generate_pdf_from_pieces(piezas, tmp_img_path, output_pdf)  # usa tu función real o la del punto 3
+    # Devuelve el PDF binario
+    return send_file(output_pdf, mimetype="application/pdf")
+# ---------------------------------------------------------------------
