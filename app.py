@@ -1,13 +1,10 @@
 # ============================================================
-# app.py (VERSIÓN COMPLETA)
-# Integrado con tu OCR real ocr_rayas_tesseract.py
-# Compatible con Render (PORT dinámico)
-# Genera JSON, overlay y PDF debug
+# app.py (DEBUG: devuelve trace en la respuesta para depuración)
 # ============================================================
-
 import os
 import json
 import tempfile
+import traceback
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.pdfgen import canvas
@@ -105,11 +102,14 @@ def generate_debug_overlay(json_path=DEBUG_JSON_PATH, out_path=DEBUG_OVERLAY_PAT
         font = ImageFont.load_default()
 
     for p in data["piezas"]:
-        x, y, w, h = p["x"], p["y"], p["w"], p["h"]
+        # Aceptamos piezas sin coords (ignoramos) para que no peten
+        if not all(k in p for k in ("x", "y", "w", "h")):
+            continue
+        x, y, w, h = int(p["x"]), int(p["y"]), int(p["w"]), int(p["h"])
         texto = p.get("texto") or p.get("ocr_texto") or "pieza"
 
         draw.rectangle([x, y, x+w, y+h], outline="red", width=3)
-        draw.text((x+4, y+4), texto, fill="yellow", font=font)
+        draw.text((x+4, y+4), str(texto), fill="yellow", font=font)
 
     img.save(out_path)
     return out_path
@@ -122,9 +122,14 @@ def pdf_from_json(json_path, image_path, out_pdf_path):
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    piezas = data["piezas"]
-    img_w = data["image_width"]
-    img_h = data["image_height"]
+    piezas = data.get("piezas", [])
+    img_w = data.get("image_width", None)
+    img_h = data.get("image_height", None)
+
+    # si no vienen dimensiones, sacamos de la imagen
+    if not img_w or not img_h:
+        im = Image.open(image_path)
+        img_w, img_h = im.size
 
     pdf_w, pdf_h = A4
     sx = pdf_w / img_w
@@ -134,14 +139,18 @@ def pdf_from_json(json_path, image_path, out_pdf_path):
     c.setFont("Helvetica", 8)
 
     for p in piezas:
-        x = p["x"] * sx
-        y = pdf_h - (p["y"] + p["h"]) * sy
+        # si la pieza no tiene cajas, la saltamos para evitar errores
+        if not all(k in p for k in ("x", "y", "w", "h")):
+            continue
+        x_px = float(p["x"]); y_px = float(p["y"]); w_px = float(p["w"]); h_px = float(p["h"])
+        x = x_px * sx
+        y = pdf_h - (y_px + h_px) * sy
 
         c.setStrokeColorRGB(1, 0, 0)
-        c.rect(x, y, p["w"]*sx, p["h"]*sy, stroke=1)
+        c.rect(x, y, w_px*sx, h_px*sy, stroke=1)
 
         txt = p.get("texto") or p.get("ocr_texto") or "pieza"
-        c.drawString(x+3, y+3, txt)
+        c.drawString(x+3, y+3, str(txt))
 
     c.showPage()
     c.save()
@@ -149,31 +158,39 @@ def pdf_from_json(json_path, image_path, out_pdf_path):
 
 
 # ============================================================
-# 6) ENDPOINT PRINCIPAL
+# 6) ENDPOINT PRINCIPAL (ahora con try/except y retorno del traceback)
 # ============================================================
 @app.route("/ocr", methods=["POST"])
 def ocr_endpoint():
-
-    file = request.files.get("file")
-
-    if not file:
-        return jsonify({"error": "Debe enviar un archivo"}), 400
-
-    tmp_img = "/tmp/uploaded.jpg"
-    file.save(tmp_img)
-
-    piezas, w, h = run_ocr_and_get_pieces(tmp_img)
-
-    save_debug_json(piezas, w, h, image_path=tmp_img)
-
     try:
-        generate_debug_overlay()
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "Debe enviar un archivo"}), 400
+
+        tmp_img = "/tmp/uploaded.jpg"
+        file.save(tmp_img)
+
+        piezas, w, h = run_ocr_and_get_pieces(tmp_img)
+
+        save_debug_json(piezas, w, h, image_path=tmp_img)
+
+        # intentar generar overlay (si hay coords)
+        try:
+            generate_debug_overlay()
+        except Exception as ex_overlay:
+            # no bloqueamos si overlay falla; lo registramos
+            app.logger.warning(f"Overlay falló: {ex_overlay}")
+
+        # generar PDF (si piezas tienen coords, lo rellenará; si no, será vacio de rects)
+        pdf_from_json(DEBUG_JSON_PATH, tmp_img, OUTPUT_PDF_PATH)
+
+        return send_file(OUTPUT_PDF_PATH, mimetype="application/pdf")
+
     except Exception as e:
-        app.logger.warning(f"Overlay falló: {e}")
-
-    pdf_from_json(DEBUG_JSON_PATH, tmp_img, OUTPUT_PDF_PATH)
-
-    return send_file(OUTPUT_PDF_PATH, mimetype="application/pdf")
+        tb = traceback.format_exc()
+        app.logger.error("Exception in /ocr: " + tb)
+        # devuelve JSON con la traza para debug
+        return jsonify({"error": str(e), "traceback": tb}), 500
 
 
 # ============================================================
