@@ -4,12 +4,12 @@ OCR helper para Carpinter-IA
 Archivo único: ocr_rayas_tesseract.py
 
 Funciones públicas:
-- run_ocr_and_get_pieces(image_path, lang="eng+spa")
+- run_ocr_and_get_pieces(image_path, debug_overlay=None, lang="eng+spa")
     -> devuelve (piezas, width, height)
     -> guarda debug_overlay.png en /tmp si detecta cajas (solo si ruta destino != input)
     -> registra /tmp/last_result.json (no necesario, app.py puede usarlo)
 
-Está hecho para ser robusto en servidores tipo Render (Linux) y en Windows local.
+Hecho robusto para servidores tipo Render (Linux) y Windows local.
 """
 
 import os
@@ -26,7 +26,6 @@ import numpy as np
 import pytesseract
 
 # --------------------- Config/entorno Tesseract portable ---------------------
-# Prioridad: variables de entorno (útil en Render/Docker)
 TESSERACT_CMD_ENV = os.environ.get("TESSERACT_CMD")
 TESSDATA_PREFIX_ENV = os.environ.get("TESSDATA_PREFIX")
 
@@ -35,7 +34,6 @@ if TESSERACT_CMD_ENV:
 else:
     if os.name == "nt" or platform.system().lower().startswith("win"):
         default_win = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        # asignamos default incluso si no existe -> pytesseract dará error si falta, pero queda configurable
         pytesseract.pytesseract.tesseract_cmd = default_win
     else:
         pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
@@ -60,14 +58,13 @@ logger = logging.getLogger("carpinter_ocr")
 MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", 1400))
 OCR_TIMEOUT_LINE = int(os.environ.get("OCR_TIMEOUT_LINE", 12))
 OCR_TIMEOUT_GLOBAL = int(os.environ.get("OCR_TIMEOUT_GLOBAL", 30))
-MIN_DIM = int(os.environ.get("OCR_MIN_DIM", 40))   # mm heurístico / px thresholds
+
+# --------------------- Paths por defecto ---------------------
+DEBUG_OVERLAY_DEFAULT = "/tmp/debug_overlay.png"
+LAST_JSON_PATH = "/tmp/last_result.json"
 
 # --------------------- Funciones auxiliares ---------------------
 def _extract_pairs_from_text(texto):
-    """
-    Extrae tripletas (cantidad,largo,ancho) desde texto crudo.
-    Devuelve lista de (cant,largo,ancho) como ints.
-    """
     texto = texto.replace("×", "x").replace("X", "x")
     texto = re.sub(r"[=\:\-]+", " ", texto)
     patron = re.compile(r"(?:\b(\d{1,2})\b\s+)?(\d{2,4})\s*[x]\s*(\d{2,4})")
@@ -76,17 +73,12 @@ def _extract_pairs_from_text(texto):
         cant = int(m.group(1)) if m.group(1) else 1
         largo = int(m.group(2))
         ancho = int(m.group(3))
-        # filtro por rango razonable (px->mm depende de la imagen, pero evita basura)
         if 40 <= largo <= 4000 and 40 <= ancho <= 4000:
             out.append((cant, largo, ancho))
     return out
 
 
 def _find_text_rows(img):
-    """
-    Detecta franjas horizontales con texto — devuelve list de ROI BGRs.
-    Método simple por proyección horizontal sobre imagen adaptively thresholded.
-    """
     try:
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     except Exception:
@@ -112,9 +104,6 @@ def _find_text_rows(img):
 
 
 def _ocr_text_line(roi, lang="eng+spa"):
-    """
-    OCR para una sola línea ROI. Ajustes: psm 7 y whitelist de dígitos + x.
-    """
     g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     if g.shape[0] < 60:
         g = cv2.resize(g, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
@@ -135,10 +124,6 @@ def _ocr_text_line(roi, lang="eng+spa"):
 
 
 def _ocr_full_image(img, lang="eng+spa"):
-    """
-    Fallback: aplica OCR sobre la imagen completa con variantes (otsu + invert)
-    y extrae pares por regex.
-    """
     piezas = []
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     g = cv2.GaussianBlur(g, (3, 3), 0)
@@ -175,18 +160,11 @@ def _ocr_full_image(img, lang="eng+spa"):
     return piezas
 
 
-# --------------------- Detección por boxes simple ---------------------
 def _detect_text_boxes(img):
-    """
-    Detección rápida de "cajas" donde hay manchas de tinta usando contornos para debug overlay.
-    Devuelve lista de (x,y,w,h,area).
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # realzar bordes
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     inv = cv2.bitwise_not(th)
-    # morfología para unir trazos
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
     morphed = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -195,43 +173,32 @@ def _detect_text_boxes(img):
     for c in contours:
         x, y, ww, hh = cv2.boundingRect(c)
         area = ww * hh
-        # filtros razonables
         if hh >= 12 and ww >= 40 and area >= 2000 and ww < w * 0.98:
             boxes.append((x, y, ww, hh, area))
-    # ordenar de arriba a abajo
     boxes = sorted(boxes, key=lambda b: b[1])
     return boxes
 
 
 def _save_debug_overlay(img, boxes, out_path):
-    """
-    Dibuja cajas sobre imagen y guarda en out_path.
-    Evita error si src == dst: si out_path equals a temp file used as source, escribe a tmp distinto y renombra.
-    """
     if not boxes:
         return None
     vis = img.copy()
     for (x, y, w, h, _) in boxes:
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        # intentar poner texto con background
         text = f"{x}x{y} {w}x{h}"
         cv2.putText(vis, text, (x + 4, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-    # Si out_path equals input image path, write to tmp then move
     try:
         tmp_out = out_path
         if os.path.exists(out_path):
-            # avoid overwriting same file in a way that causes shutil errors: write to a new tmp file then replace
             fd, tmp_name = tempfile.mkstemp(suffix=os.path.splitext(out_path)[1], dir=os.path.dirname(out_path) or "/tmp")
             os.close(fd)
             tmp_out = tmp_name
         cv2.imwrite(tmp_out, vis)
         if tmp_out != out_path:
-            # safe rename (overwrite)
             try:
                 shutil.move(tmp_out, out_path)
             except Exception:
-                # fallback: copy and unlink
                 shutil.copy(tmp_out, out_path)
                 os.unlink(tmp_out)
         return out_path
@@ -240,8 +207,7 @@ def _save_debug_overlay(img, boxes, out_path):
         return None
 
 
-# --------------------- Export / util JSON ---------------------
-def _write_last_result_json(result_obj, path="/tmp/last_result.json"):
+def _write_last_result_json(result_obj, path=LAST_JSON_PATH):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(result_obj, f, ensure_ascii=False, indent=2)
@@ -249,19 +215,14 @@ def _write_last_result_json(result_obj, path="/tmp/last_result.json"):
         logger.debug(f"No se pudo escribir last_result.json: {e}")
 
 
-# --------------------- Lógica principal de análisis ---------------------
 def analyze_image(image_path, lang="eng+spa", dump_csv=False):
-    """
-    Analiza imagen local y devuelve lista de piezas (dict con cantidad,largo,ancho,cantos,ocr_texto)
-    También genera debug_overlay.png en /tmp si detecta cajas.
-    """
     logger.info(f"Analyze image: {image_path}")
     start = time.time()
 
     img = cv2.imread(image_path)
     if img is None:
         logger.error("No se pudo leer la imagen.")
-        return []
+        return [], 0, 0
 
     h, w = img.shape[:2]
     if max(h, w) > MAX_SIDE:
@@ -269,12 +230,10 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
         img = cv2.resize(img, (int(w * esc), int(h * esc)))
         logger.debug(f"Imagen reducida a {img.shape[1]}x{img.shape[0]}")
 
-    # DETECCIÓN POR CAJAS (rápida)
     boxes = _detect_text_boxes(img)
     piezas = []
     if boxes:
         logger.info(f"Detectadas {len(boxes)} cajas")
-        # intentamos OCR en cada box (expandir un poco la caja)
         for i, (x, y, ww, hh, _) in enumerate(boxes, start=1):
             pad_x = int(ww * 0.03) + 2
             pad_y = int(hh * 0.15) + 2
@@ -283,7 +242,6 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
             x1 = min(img.shape[1], x + ww + pad_x)
             y1 = min(img.shape[0], y + hh + pad_y)
             roi = img[y0:y1, x0:x1]
-            # primero OCR por linea si detecta varias bandas dentro del roi
             filas = _find_text_rows(roi)
             if filas:
                 for j, r in enumerate(filas, 1):
@@ -296,7 +254,6 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
                                        "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
                                        "ocr_texto": f"{cant} {largo}x{ancho}"})
             else:
-                # si no detectó filas, hacemos OCR en el roi entero usando psm 7 y 6
                 for psm in (7, 6):
                     cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789xX -c classify_bln_numeric_mode=1"
                     try:
@@ -311,17 +268,15 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
                             piezas.append({"cantidad": cant, "largo": largo, "ancho": ancho,
                                            "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
                                            "ocr_texto": f"{cant} {largo}x{ancho}"})
-                        break  # si sacamos algo ya paramos psm loop
+                        break
 
-    # Si no hay resultados, fallback global
     if not piezas:
         logger.info("No se detectaron piezas por cajas; probando OCR global")
         piezas = _ocr_full_image(img, lang=lang)
 
     # Guardar overlay seguro (solo si hay cajas)
     try:
-        overlay_out = "/tmp/debug_overlay.png"
-        # Si overlay would be same as input path, pick a different tmp path
+        overlay_out = DEBUG_OVERLAY_DEFAULT
         input_abs = os.path.abspath(image_path)
         if os.path.abspath(overlay_out) == input_abs:
             overlay_out = os.path.join("/tmp", f"debug_overlay_{int(time.time())}.png")
@@ -331,21 +286,7 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
     except Exception as e:
         logger.debug(f"No se pudo generar overlay: {e}")
 
-    # Crear CSV si se pidió (útil local)
-    try:
-        if dump_csv:
-            csv_path = "/tmp/result_ocr.csv"
-            import csv
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                wcsv = csv.writer(f)
-                wcsv.writerow(["cantidad", "largo", "ancho", "ocr_texto"])
-                for p in piezas:
-                    wcsv.writerow([p.get("cantidad"), p.get("largo"), p.get("ancho"), p.get("ocr_texto")])
-            logger.debug(f"CSV guardado en {csv_path}")
-    except Exception:
-        pass
-
-    # Guardar last_result.json para que app.py lo pueda leer si quiere
+    # Guardar last_result.json
     try:
         result_obj = {
             "image_height": int(h),
@@ -353,7 +294,7 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
             "meta": {"image_path": image_path},
             "piezas": piezas
         }
-        _write_last_result_json(result_obj, path="/tmp/last_result.json")
+        _write_last_result_json(result_obj, path=LAST_JSON_PATH)
     except Exception as e:
         logger.debug(f"Error guardando last_result.json: {e}")
 
@@ -361,21 +302,31 @@ def analyze_image(image_path, lang="eng+spa", dump_csv=False):
     return piezas, img.shape[1], img.shape[0]
 
 
-# --------------------- Función pública solicitada por app.py ---------------------
-def run_ocr_and_get_pieces(image_path, lang="eng+spa"):
+def run_ocr_and_get_pieces(image_path, debug_overlay=None, lang="eng+spa"):
     """
-    Conveniencia: llama a analyze_image y devuelve (piezas, width, height).
-    Mantener nombre estable para import en app.py.
+    Public API expected by app.py.
+    If debug_overlay is provided (path), copy the internal /tmp/debug_overlay.png to that path.
+    Returns (piezas, width, height).
     """
     try:
         piezas, w, h = analyze_image(image_path, lang=lang)
+        # Si el usuario pidió un path para el overlay, copiarlo si existe
+        internal_overlay = DEBUG_OVERLAY_DEFAULT
+        if debug_overlay and os.path.exists(internal_overlay):
+            try:
+                # si rutas coinciden, saltar copia
+                if os.path.abspath(debug_overlay) != os.path.abspath(internal_overlay):
+                    # asegurar directorio destino
+                    os.makedirs(os.path.dirname(debug_overlay), exist_ok=True)
+                    shutil.copy(internal_overlay, debug_overlay)
+            except Exception as e:
+                logger.debug(f"No se pudo copiar overlay a {debug_overlay}: {e}")
         return piezas, w, h
     except Exception as e:
         logger.exception(f"run_ocr_and_get_pieces error: {e}")
         return [], 0, 0
 
 
-# Si se ejecuta localmente como script -> prueba rápida
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
