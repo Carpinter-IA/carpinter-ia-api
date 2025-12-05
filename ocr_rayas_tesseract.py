@@ -1,13 +1,32 @@
+# -*- coding: utf-8 -*-
+"""
+OCR helper para Carpinter-IA
+Archivo único: ocr_rayas_tesseract.py
+
+Funciones públicas:
+- run_ocr_and_get_pieces(image_path, lang="eng+spa")
+    -> devuelve (piezas, width, height)
+    -> guarda debug_overlay.png en /tmp si detecta cajas (solo si ruta destino != input)
+    -> registra /tmp/last_result.json (no necesario, app.py puede usarlo)
+
+Está hecho para ser robusto en servidores tipo Render (Linux) y en Windows local.
+"""
+
 import os
+import re
+import json
+import time
+import tempfile
+import platform
+import shutil
+import logging
+
 import cv2
 import numpy as np
 import pytesseract
-from pytesseract import Output
-import math
 
-# ==================== CONFIGURACIÓN TESSERACT (PORTABLE) ====================
-import platform
-
+# --------------------- Config/entorno Tesseract portable ---------------------
+# Prioridad: variables de entorno (útil en Render/Docker)
 TESSERACT_CMD_ENV = os.environ.get("TESSERACT_CMD")
 TESSDATA_PREFIX_ENV = os.environ.get("TESSDATA_PREFIX")
 
@@ -16,6 +35,7 @@ if TESSERACT_CMD_ENV:
 else:
     if os.name == "nt" or platform.system().lower().startswith("win"):
         default_win = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        # asignamos default incluso si no existe -> pytesseract dará error si falta, pero queda configurable
         pytesseract.pytesseract.tesseract_cmd = default_win
     else:
         pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
@@ -31,161 +51,337 @@ else:
 os.environ.pop("TESSDATA_PREFIX", None)
 os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
 
-# ============================================================================
+# --------------------- Logging (simple) ---------------------
+LOG_LEVEL = os.environ.get("OCR_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="[OCR %(levelname)s] %(message)s")
+logger = logging.getLogger("carpinter_ocr")
 
-DEBUG_OVERLAY_PATH = "/tmp/debug_overlay.png"
-LAST_JSON_PATH = "/tmp/last_result.json"
+# --------------------- Ajustes OCR/transformaciones ---------------------
+MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", 1400))
+OCR_TIMEOUT_LINE = int(os.environ.get("OCR_TIMEOUT_LINE", 12))
+OCR_TIMEOUT_GLOBAL = int(os.environ.get("OCR_TIMEOUT_GLOBAL", 30))
+MIN_DIM = int(os.environ.get("OCR_MIN_DIM", 40))   # mm heurístico / px thresholds
+
+# --------------------- Funciones auxiliares ---------------------
+def _extract_pairs_from_text(texto):
+    """
+    Extrae tripletas (cantidad,largo,ancho) desde texto crudo.
+    Devuelve lista de (cant,largo,ancho) como ints.
+    """
+    texto = texto.replace("×", "x").replace("X", "x")
+    texto = re.sub(r"[=\:\-]+", " ", texto)
+    patron = re.compile(r"(?:\b(\d{1,2})\b\s+)?(\d{2,4})\s*[x]\s*(\d{2,4})")
+    out = []
+    for m in patron.finditer(texto):
+        cant = int(m.group(1)) if m.group(1) else 1
+        largo = int(m.group(2))
+        ancho = int(m.group(3))
+        # filtro por rango razonable (px->mm depende de la imagen, pero evita basura)
+        if 40 <= largo <= 4000 and 40 <= ancho <= 4000:
+            out.append((cant, largo, ancho))
+    return out
 
 
-# ==================== FUNCIONES AUXILIARES ====================
-
-def deskew_image(img):
+def _find_text_rows(img):
+    """
+    Detecta franjas horizontales con texto — devuelve list de ROI BGRs.
+    Método simple por proyección horizontal sobre imagen adaptively thresholded.
+    """
     try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bitwise_not(gray)
-
-        thresh = cv2.threshold(gray, 0, 255,
-                               cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-
-        coords = np.column_stack(np.where(thresh > 0))
-        angle = cv2.minAreaRect(coords)[-1]
-
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-
-        (h, w) = img.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(img, M, (w, h),
-                                 flags=cv2.INTER_CUBIC,
-                                 borderMode=cv2.BORDER_REPLICATE)
-        return rotated
-    except:
-        return img
-
-
-def detect_boxes(img):
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    th = cv2.adaptiveThreshold(gray, 255,
-                               cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY_INV,
-                               25, 15)
-
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-
-        if 40 < bw < w * 0.7 and 25 < bh < h * 0.25:
-            boxes.append((x, y, bw, bh))
-
-    return sorted(boxes, key=lambda b: (b[1], b[0]))
-
-
-def ocr_box(img, box, lang="eng+spa"):
-    x, y, w, h = box
-    crop = img[y:y+h, x:x+w]
-
-    config = "--psm 6 -c tessedit_char_whitelist=0123456789xX= "
-    text = pytesseract.image_to_string(crop, lang=lang, config=config)
-    return text.strip()
-
-
-def parse_piece(text):
-    text = text.replace(" ", "").lower()
-
-    if "=" not in text or "x" not in text:
-        return None
-
-    try:
-        cant, rest = text.split("=")
-        largo, alto = rest.split("x")
-        cant = int(cant)
-        largo = int(largo)
-        alto = int(alto)
-        return {"cantidad": cant, "largo": largo, "ancho": alto}
-    except:
-        return None
-
-
-# ==================== OCR PRINCIPAL ====================
-
-def analyze_image(image_path, lang="eng+spa"):
-    img = cv2.imread(image_path)
-    if img is None:
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    except Exception:
         return []
+    thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 31, 7)
+    inv = cv2.bitwise_not(thr)
+    hproj = np.sum(inv // 255, axis=1)
+    h = inv.shape[0]
+    umbral = max(8, int(inv.shape[1] * 0.02))
+    filas, en_banda, y0 = [], False, 0
+    for y in range(h):
+        if hproj[y] > umbral and not en_banda:
+            en_banda, y0 = True, y
+        elif hproj[y] <= umbral and en_banda:
+            en_banda = False
+            y1 = y
+            if y1 - y0 >= 12:
+                filas.append(img[y0:y1, :])
+    if en_banda and h - y0 >= 12:
+        filas.append(img[y0:h, :])
+    return filas
 
-    original_h, original_w = img.shape[:2]
 
-    img = deskew_image(img)
+def _ocr_text_line(roi, lang="eng+spa"):
+    """
+    OCR para una sola línea ROI. Ajustes: psm 7 y whitelist de dígitos + x.
+    """
+    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    if g.shape[0] < 60:
+        g = cv2.resize(g, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    g = cv2.medianBlur(g, 3)
+    _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cfg = (
+        "--oem 3 --psm 7 "
+        "-c tessedit_char_whitelist=0123456789xX "
+        "-c classify_bln_numeric_mode=1 "
+        "-c user_defined_dpi=180"
+    )
+    try:
+        txt = pytesseract.image_to_string(bw, lang=lang, config=cfg, timeout=OCR_TIMEOUT_LINE)
+    except RuntimeError:
+        return ""
+    txt = re.sub(r"[^\dxX ]", " ", txt)
+    return re.sub(r"\s+", " ", txt).strip()
 
-    boxes = detect_boxes(img)
 
-    overlay = img.copy()
-    for (x, y, w, h) in boxes:
-        cv2.rectangle(overlay, (x, y), (x+w, y+h), (0, 0, 255), 2)
-    cv2.imwrite(DEBUG_OVERLAY_PATH, overlay)
-
+def _ocr_full_image(img, lang="eng+spa"):
+    """
+    Fallback: aplica OCR sobre la imagen completa con variantes (otsu + invert)
+    y extrae pares por regex.
+    """
     piezas = []
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
 
-    # 1) Intento por cajas
-    for box in boxes:
-        text = ocr_box(img, box)
-        p = parse_piece(text)
-        if p:
-            piezas.append(p)
+    variantes = []
+    _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variantes.append(otsu)
+    variantes.append(cv2.bitwise_not(otsu))
 
-    # 2) OCR global si fallo lo anterior
-    if not piezas:
-        config = "--psm 6 -c tessedit_char_whitelist=0123456789xX= "
-        text = pytesseract.image_to_string(img, lang=lang, config=config)
-        lines = text.split("\n")
+    base_cfg = (
+        "--oem 3 -c tessedit_char_whitelist=0123456789xX=:-/ "
+        "-c classify_bln_numeric_mode=1 "
+        "-c user_defined_dpi=180"
+    )
 
-        for ln in lines:
-            p = parse_piece(ln)
-            if p:
-                piezas.append(p)
+    textos = []
+    for v in variantes:
+        for psm in (6, 11, 7):
+            cfg = f"{base_cfg} --psm {psm}"
+            try:
+                t = pytesseract.image_to_string(v, lang=lang, config=cfg, timeout=OCR_TIMEOUT_GLOBAL)
+                textos.append(t)
+            except RuntimeError:
+                logger.debug(f"Fallback global OCR psm {psm} timeout")
+                continue
 
-    # Guardamos json para /last_result.json
-    import json
-    with open(LAST_JSON_PATH, "w", encoding="utf8") as f:
-        json.dump({
-            "image_width": original_w,
-            "image_height": original_h,
-            "piezas": piezas,
-            "meta": {"image_path": image_path}
-        }, f, ensure_ascii=False)
-
+    bruto = re.sub(r"[^\d xX]", " ", " ".join(textos))
+    for (cant, largo, ancho) in _extract_pairs_from_text(bruto):
+        piezas.append({
+            "cantidad": cant, "largo": largo, "ancho": ancho,
+            "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
+            "ocr_texto": f"{cant} {largo}x{ancho}"
+        })
     return piezas
 
 
-# ==================== WRAPPER COMPATIBLE PARA app.py ====================
+# --------------------- Detección por boxes simple ---------------------
+def _detect_text_boxes(img):
+    """
+    Detección rápida de "cajas" donde hay manchas de tinta usando contornos para debug overlay.
+    Devuelve lista de (x,y,w,h,area).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # realzar bordes
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inv = cv2.bitwise_not(th)
+    # morfología para unir trazos
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    morphed = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    h, w = img.shape[:2]
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        area = ww * hh
+        # filtros razonables
+        if hh >= 12 and ww >= 40 and area >= 2000 and ww < w * 0.98:
+            boxes.append((x, y, ww, hh, area))
+    # ordenar de arriba a abajo
+    boxes = sorted(boxes, key=lambda b: b[1])
+    return boxes
 
-def run_ocr_and_get_pieces(image_path, debug_overlay=None, lang="eng+spa"):
+
+def _save_debug_overlay(img, boxes, out_path):
     """
-    Render espera EXACTAMENTE esta función.
-    Retorna: (piezas, width, height)
+    Dibuja cajas sobre imagen y guarda en out_path.
+    Evita error si src == dst: si out_path equals a temp file used as source, escribe a tmp distinto y renombra.
     """
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(image_path)
+    if not boxes:
+        return None
+    vis = img.copy()
+    for (x, y, w, h, _) in boxes:
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        # intentar poner texto con background
+        text = f"{x}x{y} {w}x{h}"
+        cv2.putText(vis, text, (x + 4, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # Si out_path equals input image path, write to tmp then move
+    try:
+        tmp_out = out_path
+        if os.path.exists(out_path):
+            # avoid overwriting same file in a way that causes shutil errors: write to a new tmp file then replace
+            fd, tmp_name = tempfile.mkstemp(suffix=os.path.splitext(out_path)[1], dir=os.path.dirname(out_path) or "/tmp")
+            os.close(fd)
+            tmp_out = tmp_name
+        cv2.imwrite(tmp_out, vis)
+        if tmp_out != out_path:
+            # safe rename (overwrite)
+            try:
+                shutil.move(tmp_out, out_path)
+            except Exception:
+                # fallback: copy and unlink
+                shutil.copy(tmp_out, out_path)
+                os.unlink(tmp_out)
+        return out_path
+    except Exception as e:
+        logger.warning(f"No se pudo guardar overlay: {e}")
+        return None
+
+
+# --------------------- Export / util JSON ---------------------
+def _write_last_result_json(result_obj, path="/tmp/last_result.json"):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result_obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.debug(f"No se pudo escribir last_result.json: {e}")
+
+
+# --------------------- Lógica principal de análisis ---------------------
+def analyze_image(image_path, lang="eng+spa", dump_csv=False):
+    """
+    Analiza imagen local y devuelve lista de piezas (dict con cantidad,largo,ancho,cantos,ocr_texto)
+    También genera debug_overlay.png en /tmp si detecta cajas.
+    """
+    logger.info(f"Analyze image: {image_path}")
+    start = time.time()
 
     img = cv2.imread(image_path)
     if img is None:
-        raise RuntimeError(f"No se pudo leer la imagen {image_path}")
+        logger.error("No se pudo leer la imagen.")
+        return []
 
     h, w = img.shape[:2]
+    if max(h, w) > MAX_SIDE:
+        esc = MAX_SIDE / max(h, w)
+        img = cv2.resize(img, (int(w * esc), int(h * esc)))
+        logger.debug(f"Imagen reducida a {img.shape[1]}x{img.shape[0]}")
 
-    piezas = analyze_image(image_path, lang=lang)
+    # DETECCIÓN POR CAJAS (rápida)
+    boxes = _detect_text_boxes(img)
+    piezas = []
+    if boxes:
+        logger.info(f"Detectadas {len(boxes)} cajas")
+        # intentamos OCR en cada box (expandir un poco la caja)
+        for i, (x, y, ww, hh, _) in enumerate(boxes, start=1):
+            pad_x = int(ww * 0.03) + 2
+            pad_y = int(hh * 0.15) + 2
+            x0 = max(0, x - pad_x)
+            y0 = max(0, y - pad_y)
+            x1 = min(img.shape[1], x + ww + pad_x)
+            y1 = min(img.shape[0], y + hh + pad_y)
+            roi = img[y0:y1, x0:x1]
+            # primero OCR por linea si detecta varias bandas dentro del roi
+            filas = _find_text_rows(roi)
+            if filas:
+                for j, r in enumerate(filas, 1):
+                    t = _ocr_text_line(r, lang=lang)
+                    if not t:
+                        continue
+                    logger.debug(f"[OCR][box {i} fila {j}] '{t}'")
+                    for (cant, largo, ancho) in _extract_pairs_from_text(t):
+                        piezas.append({"cantidad": cant, "largo": largo, "ancho": ancho,
+                                       "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
+                                       "ocr_texto": f"{cant} {largo}x{ancho}"})
+            else:
+                # si no detectó filas, hacemos OCR en el roi entero usando psm 7 y 6
+                for psm in (7, 6):
+                    cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789xX -c classify_bln_numeric_mode=1"
+                    try:
+                        t = pytesseract.image_to_string(roi, lang=lang, config=cfg, timeout=OCR_TIMEOUT_LINE)
+                    except RuntimeError:
+                        t = ""
+                    t = re.sub(r"[^\dxX ]", " ", t)
+                    t = re.sub(r"\s+", " ", t).strip()
+                    if t:
+                        logger.debug(f"[OCR][box {i} psm{psm}] '{t}'")
+                        for (cant, largo, ancho) in _extract_pairs_from_text(t):
+                            piezas.append({"cantidad": cant, "largo": largo, "ancho": ancho,
+                                           "cantos": {"L1": False, "L2": False, "A1": False, "A2": False},
+                                           "ocr_texto": f"{cant} {largo}x{ancho}"})
+                        break  # si sacamos algo ya paramos psm loop
 
-    if debug_overlay:
-        if os.path.exists(DEBUG_OVERLAY_PATH):
-            import shutil
-            shutil.copy(DEBUG_OVERLAY_PATH, debug_overlay)
+    # Si no hay resultados, fallback global
+    if not piezas:
+        logger.info("No se detectaron piezas por cajas; probando OCR global")
+        piezas = _ocr_full_image(img, lang=lang)
 
-    return piezas, w, h
+    # Guardar overlay seguro (solo si hay cajas)
+    try:
+        overlay_out = "/tmp/debug_overlay.png"
+        # Si overlay would be same as input path, pick a different tmp path
+        input_abs = os.path.abspath(image_path)
+        if os.path.abspath(overlay_out) == input_abs:
+            overlay_out = os.path.join("/tmp", f"debug_overlay_{int(time.time())}.png")
+        saved = _save_debug_overlay(img, boxes, overlay_out)
+        if saved:
+            logger.debug(f"Overlay guardado en {saved}")
+    except Exception as e:
+        logger.debug(f"No se pudo generar overlay: {e}")
+
+    # Crear CSV si se pidió (útil local)
+    try:
+        if dump_csv:
+            csv_path = "/tmp/result_ocr.csv"
+            import csv
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                wcsv = csv.writer(f)
+                wcsv.writerow(["cantidad", "largo", "ancho", "ocr_texto"])
+                for p in piezas:
+                    wcsv.writerow([p.get("cantidad"), p.get("largo"), p.get("ancho"), p.get("ocr_texto")])
+            logger.debug(f"CSV guardado en {csv_path}")
+    except Exception:
+        pass
+
+    # Guardar last_result.json para que app.py lo pueda leer si quiere
+    try:
+        result_obj = {
+            "image_height": int(h),
+            "image_width": int(w),
+            "meta": {"image_path": image_path},
+            "piezas": piezas
+        }
+        _write_last_result_json(result_obj, path="/tmp/last_result.json")
+    except Exception as e:
+        logger.debug(f"Error guardando last_result.json: {e}")
+
+    logger.info(f"Análisis finalizado en {int((time.time()-start)*1000)} ms. Piezas: {len(piezas)}")
+    return piezas, img.shape[1], img.shape[0]
+
+
+# --------------------- Función pública solicitada por app.py ---------------------
+def run_ocr_and_get_pieces(image_path, lang="eng+spa"):
+    """
+    Conveniencia: llama a analyze_image y devuelve (piezas, width, height).
+    Mantener nombre estable para import en app.py.
+    """
+    try:
+        piezas, w, h = analyze_image(image_path, lang=lang)
+        return piezas, w, h
+    except Exception as e:
+        logger.exception(f"run_ocr_and_get_pieces error: {e}")
+        return [], 0, 0
+
+
+# Si se ejecuta localmente como script -> prueba rápida
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Uso: python ocr_rayas_tesseract.py <imagen>")
+        sys.exit(1)
+    imgp = sys.argv[1]
+    os.environ["OCR_DEBUG"] = "1"
+    pcs, W, H = run_ocr_and_get_pieces(imgp)
+    print("RESULT:", pcs)
