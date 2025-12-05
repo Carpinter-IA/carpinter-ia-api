@@ -4,14 +4,8 @@ generar_pdf.py
 Módulo auxiliar simple para Carpinter-IA que genera un PDF en memoria a partir
 de la lista de piezas + metadatos.
 
-Funciones públicas (cualquiera de estas puede ser llamada por app.py):
-- generar_pdf_bytes(piezas, meta=None, material=None, espesor=None, cliente=None) -> bytes
-- generar_pdf(piezas, meta=None, material=None, espesor=None, cliente=None) -> bytes
-- create_pdf_bytes(...), generate_pdf_bytes(...), exportar_pdf_maestro_bytes(...)
-
-También exporta generar_xlsx_bytes(piezas, ...) por si la API lo solicita.
-
-Dependencias: reportlab, openpyxl (ya las tienes en requirements).
+Incluye múltiples nombres compatibles para que app.py o cualquier otro fichero
+pueda importar la función que espere (crear_pdf_desde_piezas, generar_pdf_bytes, etc).
 """
 
 from reportlab.lib.pagesizes import A4, landscape
@@ -115,11 +109,18 @@ def generar_pdf_bytes(piezas, meta=None, material=None, espesor=None, cliente=No
     buf.close()
     return pdf
 
-# alias y compatibilidades
-def generate_pdf_bytes(*args, **kwargs):
-    return generar_pdf_bytes(*args, **kwargs)
+# Compatibilidad: alias y múltiples nombres que app.py pueda importar
+def crear_pdf_desde_piezas(piezas, meta=None, material=None, espesor=None, cliente=None):
+    """
+    Nombre esperado por algunas versiones de app.py.
+    Devuelve bytes del PDF.
+    """
+    return generar_pdf_bytes(piezas, meta=meta, material=material, espesor=espesor, cliente=cliente)
 
-def generar_pdf(*args, **kwargs):
+def generar_pdf(piezas, meta=None, material=None, espesor=None, cliente=None):
+    return generar_pdf_bytes(piezas, meta=meta, material=material, espesor=espesor, cliente=cliente)
+
+def generate_pdf_bytes(*args, **kwargs):
     return generar_pdf_bytes(*args, **kwargs)
 
 def create_pdf_bytes(*args, **kwargs):
